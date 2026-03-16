@@ -14,7 +14,7 @@ from math import radians, sin, cos, sqrt, atan2
 INVALID_MMSI_PATTERNS = {
     '000000000',
     '111111111',
-    '222222222'
+    '222222222',
     '333333333',
     '444444444',
     '555555555',
@@ -51,67 +51,86 @@ COL_NAME = 12
 COL_SHIP_TYPE = 13
 COL_DRAUGHT = 18
 
-
-# UTILITY FUNCTIONS FOR ANOMALY DETECTION
+# ANOMALY DETECTION HELPERS
 
 def parse_timestamp(ts_str: str) -> datetime.datetime:
-    """Parse timestamp in format DD/MM/YYYY HH:MM:SS"""
-    return datetime.datetime.strptime(ts_str, "%d/%m/%Y %H:%M:%S")
+    """Parse AIS timestamp in format DD/MM/YYYY HH:MM:SS."""
+    return datetime.datetime.strptime(ts_str.strip(), "%d/%m/%Y %H:%M:%S")
+
 
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Calculate haversine distance in kilometers"""
-    R = 6371  # Earth radius in km
+    """Return the great-circle distance in kilometres between two points."""
+    R = 6371.0
     dlat = radians(lat2 - lat1)
     dlon = radians(lon2 - lon1)
-    a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
-    c = 2 * atan2(sqrt(a), sqrt(1-a))
-    return R * c
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    return R * 2 * atan2(sqrt(a), sqrt(1 - a))
 
-# FIX 1: Sort rows before passing to detect_going_dark_anomalies,
-# so the detection function can assume chronological order and skip re-sorting.
-def detect_going_dark_anomalies(rows: List[List[str]]) -> List[Dict[str, Any]]:
+
+# Reference point for converting timestamps to compact integers (fast sort key)
+_EPOCH = datetime.datetime(2000, 1, 1)
+
+
+def ts_to_epoch(ts_str: str) -> int:
+    """Parse AIS timestamp (DD/MM/YYYY HH:MM:SS) to integer seconds since 2000-01-01."""
+    dt = datetime.datetime.strptime(ts_str.strip(), "%d/%m/%Y %H:%M:%S")
+    return int((dt - _EPOCH).total_seconds())
+
+
+def detect_going_dark_anomalies(
+    mmsi: str,
+    records: List[Tuple],
+    gap_threshold_hours: float = 4.0,
+    movement_threshold_km: float = 5.0,
+) -> List[Dict[str, Any]]:
     """
-    Detect 'Going Dark' anomalies for a vessel's chronological records.
-    Rows must already be sorted by timestamp before calling this function.
+    Detect 'Going Dark' anomalies in a vessel's pre-sorted lightweight records.
+
+    A going-dark event is flagged when:
+      - There is a gap of more than *gap_threshold_hours* between consecutive
+        AIS messages, AND
+      - The haversine distance between the last known position before the gap
+        and the first position after is greater than *movement_threshold_km*,
+        meaning the vessel was not simply sitting at anchor.
+
+    Args:
+        mmsi: Vessel identifier.
+        records: Pre-sorted list of (ts_str, epoch_sec, lat, lon) tuples.
+        gap_threshold_hours: Minimum silence gap to flag (default 4 h).
+        movement_threshold_km: Minimum displacement to flag as movement (default 5 km).
+
+    Returns:
+        List of anomaly dicts, one per detected event.
     """
-    if len(rows) < 2:
+    if len(records) < 2:
         return []
 
     anomalies = []
-    for i in range(1, len(rows)):
-        prev_row = rows[i-1]
-        curr_row = rows[i]
-        
-        prev_ts = parse_timestamp(prev_row[COL_TIMESTAMP])
-        curr_ts = parse_timestamp(curr_row[COL_TIMESTAMP])
-        
-        gap_hours = (curr_ts - prev_ts).total_seconds() / 3600
-        
-        if gap_hours > 4:
-            try:
-                prev_lat = float(prev_row[COL_LATITUDE])
-                prev_lon = float(prev_row[COL_LONGITUDE])
-                curr_lat = float(curr_row[COL_LATITUDE])
-                curr_lon = float(curr_row[COL_LONGITUDE])
-                
-                dist = haversine_distance(prev_lat, prev_lon, curr_lat, curr_lon)
-                
-                if dist > 0.1:
-                    anomalies.append({
-                        'mmsi': prev_row[COL_MMSI],
-                        'gap_start': prev_row[COL_TIMESTAMP],
-                        'gap_end': curr_row[COL_TIMESTAMP],
-                        'gap_hours': gap_hours,
-                        'distance_km': dist,
-                        'prev_pos': (prev_lat, prev_lon),
-                        'curr_pos': (curr_lat, curr_lon),
-                        'anomaly_type': 'going_dark'
-                    })
-            except (ValueError, IndexError):
-                continue
-    
-    return anomalies
+    gap_threshold_sec = gap_threshold_hours * 3600
+    for i in range(1, len(records)):
+        prev_ts_str, prev_epoch, prev_lat, prev_lon = records[i - 1]
+        curr_ts_str, curr_epoch, curr_lat, curr_lon = records[i]
 
+        gap_sec = curr_epoch - prev_epoch
+        if gap_sec <= gap_threshold_sec:
+            continue
+
+        dist_km = haversine_distance(prev_lat, prev_lon, curr_lat, curr_lon)
+        if dist_km <= movement_threshold_km:
+            continue  # Vessel did not move — likely anchored, not suspicious
+
+        anomalies.append({
+            'mmsi': mmsi,
+            'gap_start': prev_ts_str,
+            'gap_end': curr_ts_str,
+            'gap_hours': round(gap_sec / 3600.0, 2),
+            'distance_km': round(dist_km, 2),
+            'pos_before': (prev_lat, prev_lon),
+            'pos_after': (curr_lat, curr_lon),
+            'anomaly_type': 'going_dark',
+        })
+
+    return anomalies
 
 
 # MEMORY MONITORING UTILITIES
@@ -133,7 +152,7 @@ def check_memory_limit(limit_mb = 1000.0):
 # DATA VALIDATION & FILTERING
 def is_valid_mmsi(mmsi, EXPECTED_MMSI_LENGTH, INVALID_MMSI_PATTERNS, INVALID_MMSI_PREFIXES):
     """
-    Check whether MMSI code is valid according to standard rules.
+    Check wether MMSI code is valid according to standard rules.
     """
 
     mmsi = mmsi.strip()
@@ -215,9 +234,11 @@ def stream_csv_rows(filepath, skip_header = True) -> Generator[List[str], None, 
             yield row
 
 
-def stream_valid_rows(filepath, COL_MMSI) -> Generator[Tuple[str, List[str]], None, None]:
+def stream_valid_rows(filepath, COL_MMSI) -> Generator[Tuple, None, None]:
     """
-    Generator that streams only valid rows, yielding (MMSI, row) tuples.
+    Generator that streams only valid rows as lightweight 5-tuples
+    (mmsi, ts_str, epoch_sec, lat, lon), skipping invalid records.
+    Numerics are pre-parsed here so workers never re-parse raw CSV text.
     """
     row_generator = stream_csv_rows(filepath, skip_header=True)
 
@@ -225,46 +246,54 @@ def stream_valid_rows(filepath, COL_MMSI) -> Generator[Tuple[str, List[str]], No
         _header = next(row_generator)
     except StopIteration:
         return
-    
+
     for row in row_generator:
-        is_valid = validate_row(row, COL_MMSI, COL_LATITUDE, COL_LONGITUDE)
-        if is_valid:
-            mmsi = row[COL_MMSI].strip()
-            yield (mmsi, row)
+        if not validate_row(row, COL_MMSI, COL_LATITUDE, COL_LONGITUDE):
+            continue
+        mmsi = row[COL_MMSI].strip()
+        try:
+            ts_str = row[COL_TIMESTAMP]
+            epoch = ts_to_epoch(ts_str)
+            lat = float(row[COL_LATITUDE])
+            lon = float(row[COL_LONGITUDE])
+        except (ValueError, IndexError):
+            continue
+        yield (mmsi, ts_str, epoch, lat, lon)
 
 
 # CHUNK PARTITIONING
-def create_chunks(filepath, chunk_size) -> Generator[List[Tuple[str, List[str]]], None, None]:
+def create_chunks(filepath, chunk_size) -> Generator[List[Tuple], None, None]:
     """
-    Generator that creates chunks of valid rows for parallel processing.
+    Generator that creates flat chunks of lightweight records.
+    Each item: (mmsi, ts_str, epoch_sec, lat, lon).
     """
     chunk = []
-    
-    for mmsi, row in stream_valid_rows(filepath, COL_MMSI):
-        chunk.append((mmsi, row))
-        
+
+    for record in stream_valid_rows(filepath, COL_MMSI):
+        chunk.append(record)
         if len(chunk) >= chunk_size:
             yield chunk
             chunk = []
             gc.collect()
-    
+
     if chunk:
         yield chunk
 
 
-def create_mmsi_partitioned_chunks(filepath, chunk_size, max_mmsi_per_chunk = 100) -> Generator[Dict[str, List[List[str]]], None, None]:
+def create_mmsi_partitioned_chunks(filepath, chunk_size, max_mmsi_per_chunk=100) -> Generator[Dict[str, List[Tuple]], None, None]:
     """
-    Generator that creates MMSI-partitioned chunks (max 100 different MMSI codes per chunk) for parallel processing.
+    Generator that creates MMSI-partitioned chunks for parallel processing.
+    Each chunk: {mmsi: [(ts_str, epoch_sec, lat, lon), ...], ...}
+    At most max_mmsi_per_chunk distinct vessels appear in each yielded dict.
     """
-    current_chunk: Dict[str, List[List[str]]] = defaultdict(list)
+    current_chunk: Dict[str, List] = defaultdict(list)
     current_size = 0
     current_mmsi_count = 0
-    
-    for mmsi, row in stream_valid_rows(filepath, COL_MMSI):
+
+    for mmsi, ts_str, epoch, lat, lon in stream_valid_rows(filepath, COL_MMSI):
         if mmsi not in current_chunk:
             current_mmsi_count += 1
-        
-        current_chunk[mmsi].append(row)
+        current_chunk[mmsi].append((ts_str, epoch, lat, lon))
         current_size += 1
 
         if current_size >= chunk_size or current_mmsi_count >= max_mmsi_per_chunk:
@@ -273,136 +302,148 @@ def create_mmsi_partitioned_chunks(filepath, chunk_size, max_mmsi_per_chunk = 10
             current_size = 0
             current_mmsi_count = 0
             gc.collect()
-    
+
     if current_chunk:
         yield dict(current_chunk)
 
 
 # PARALLEL WORKERS FUNCTIONS
+
 def worker_process(
     worker_id: int,
     task_queue: Queue,
     result_queue: Queue,
-    stop_flag: Synchronized
+    stop_flag: Synchronized,
 ) -> None:
     """
-    Worker process that receives chunks and processes them for anomaly detection.
-    Each worker owns a disjoint set of MMSIs (enforced by the coordinator's
-    hash-based routing), so accumulation and anomaly detection are always complete.
+    Worker process responsible for a disjoint set of MMSIs (guaranteed by
+    hash-based routing in the coordinator).
+
+    Memory-efficient design: stores only (ts_str, epoch_sec, lat, lon) per
+    record — not the full ~20-column CSV row. epoch_sec is a pre-parsed int
+    which makes the sort in Phase 2 a pure integer comparison.
+
+    Phase 1 – Accumulate: receive lightweight records from the coordinator.
+    Phase 2 – Detect:     sort by epoch int, then run going-dark detection.
     """
     processed_chunks = 0
     total_records = 0
-    mmsi_data: Dict[str, List[List[str]]] = defaultdict(list)
-    
+    # Dict[mmsi -> list of (ts_str, epoch_sec, lat, lon)]
+    mmsi_data: Dict[str, List[Tuple]] = defaultdict(list)
+
     print(f"[Worker {worker_id}] Started")
-    
+
+    # ----- Phase 1: accumulate ------------------------------------------------
     while not stop_flag.value:
         try:
-            # Get chunk
-            chunk = task_queue.get(timeout=0.1)
-            
+            chunk = task_queue.get(timeout=0.2)
+
             if chunk is None:  # Poison pill
                 break
-            
-            if isinstance(chunk, dict):
-                for mmsi, rows in chunk.items():
-                    mmsi_data[mmsi].extend(rows)
-                    total_records += len(rows)
-            else:
-                for mmsi, row in chunk:
-                    mmsi_data[mmsi].append(row)
-                    total_records += 1
-            
+
+            # chunk is always a dict {mmsi: [(ts_str, epoch, lat, lon), ...]}
+            for mmsi, records in chunk.items():
+                mmsi_data[mmsi].extend(records)
+                total_records += len(records)
+
             processed_chunks += 1
-            
-            mem_mb = get_memory_usage_mb()
+
             if processed_chunks % 100 == 0:
-                print(f"[Worker {worker_id}] Processed {processed_chunks} chunks, "
-                      f"{total_records:,} records, Memory: {mem_mb:.1f} MB")
-            
+                print(
+                    f"[Worker {worker_id}] {processed_chunks} chunks, "
+                    f"{total_records:,} records, {len(mmsi_data)} vessels"
+                )
+
         except Exception as e:
             if "Empty" not in str(type(e).__name__):
                 print(f"[Worker {worker_id}] Error: {e}")
             continue
-    
-    # sort each vessel's rows once before anomaly detection
-    all_anomalies = []
-    for mmsi, rows in mmsi_data.items():
-        if rows:
-            rows.sort(key=lambda r: parse_timestamp(r[COL_TIMESTAMP]))
-            anomalies = detect_going_dark_anomalies(rows)
-            all_anomalies.extend(anomalies)
-    
+
+    # ----- Phase 2: sort + detect anomalies -----------------------------------
+    all_anomalies: List[Dict[str, Any]] = []
+    for mmsi, records in mmsi_data.items():
+        if len(records) < 2:
+            continue
+        # Sort by pre-parsed integer epoch — no datetime parsing needed here
+        records.sort(key=lambda r: r[1])
+        all_anomalies.extend(detect_going_dark_anomalies(mmsi, records))
+
     result_queue.put({
         'worker_id': worker_id,
         'processed_chunks': processed_chunks,
         'total_records': total_records,
-        'unique_vessels': len(mmsi_data),
+        'mmsi_counts': {mmsi: len(recs) for mmsi, recs in mmsi_data.items()},
         'anomalies': all_anomalies,
-        'final_memory_mb': get_memory_usage_mb()
+        'final_memory_mb': get_memory_usage_mb(),
     })
-    
-    print(f"[Worker {worker_id}] Finished - {total_records:,} records processed, {len(all_anomalies)} anomalies detected")
+
+    print(
+        f"[Worker {worker_id}] Finished — {total_records:,} records, "
+        f"{len(all_anomalies)} going-dark anomalies detected"
+    )
 
 
 # MAIN PARALLEL PROCESSING COORDINATOR
+# =============================================================================
 
 class StreamingPartitioner:
     """
-    Main coordinator class for parallel processing of AIS data.
+    Main coordinator class for parallel processing of our data.
+
+    Each worker owns a dedicated queue and receives only the MMSI groups that
+    hash to its id, guaranteeing that every record for a given vessel is
+    processed by a single worker — a prerequisite for chronological anomaly
+    detection.
     """
-    
+
     def __init__(self, num_workers, chunk_size):
         self.num_workers = num_workers
         self.chunk_size = chunk_size
-        self.worker_queues: List[Queue] = [
-            Queue(maxsize=4) for _ in range(num_workers)
-        ]
+        # One bounded queue per worker instead of a single shared queue
+        self.worker_queues: List[Queue] = [Queue(maxsize=8) for _ in range(num_workers)]
         self.result_queue: Queue = Queue()
         self.stop_flag = Value('b', False)
         self.workers: List[Process] = []
-        
+
     def start_workers(self) -> None:
         """Start all worker processes."""
         for i in range(self.num_workers):
             worker = Process(
                 target=worker_process,
-                args=(i, self.worker_queues[i], self.result_queue, self.stop_flag)
+                args=(i, self.worker_queues[i], self.result_queue, self.stop_flag),
             )
             worker.start()
             self.workers.append(worker)
         print(f"Started {self.num_workers} worker processes")
-    
+
     def stop_workers(self) -> None:
         """Stop all worker processes gracefully."""
         self.stop_flag.value = True
         for q in self.worker_queues:
             q.put(None)
+
+    def _route_chunk(self, chunk) -> None:
+        """Route lightweight records to workers by hash(mmsi) % num_workers."""
+        worker_chunks: Dict[int, Dict[str, List]] = defaultdict(lambda: defaultdict(list))
+        if isinstance(chunk, dict):
+            for mmsi, records in chunk.items():
+                worker_chunks[hash(mmsi) % self.num_workers][mmsi].extend(records)
+        else:
+            # flat list: (mmsi, ts_str, epoch, lat, lon)
+            for mmsi, ts_str, epoch, lat, lon in chunk:
+                worker_chunks[hash(mmsi) % self.num_workers][mmsi].append((ts_str, epoch, lat, lon))
+
+        for worker_id, sub_chunk in worker_chunks.items():
+            self.worker_queues[worker_id].put(dict(sub_chunk))
     
     def wait_for_workers(self) -> None:
         """Wait for all workers to finish."""
         for worker in self.workers:
-            worker.join(timeout=30)
+            worker.join(timeout=180)
             if worker.is_alive():
                 worker.terminate()
         self.workers = []
     
-    def _route_chunk(self, chunk: Dict[str, List[List[str]]]) -> None:
-        # Group rows by target worker
-        worker_chunks: Dict[int, Dict[str, List[List[str]]]] = defaultdict(lambda: defaultdict(list))
-
-        if isinstance(chunk, dict):
-            for mmsi, rows in chunk.items():
-                target = hash(mmsi) % self.num_workers
-                worker_chunks[target][mmsi].extend(rows)
-        else:
-            for mmsi, row in chunk:
-                target = hash(mmsi) % self.num_workers
-                worker_chunks[target][mmsi].append(row)
-
-        for worker_id, sub_chunk in worker_chunks.items():
-            self.worker_queues[worker_id].put(dict(sub_chunk))
-
     def process_file(self, filepath: str, use_mmsi_partitioning: bool = True) -> Dict[str, Any]:
         """
         Process a CSV file using parallel workers.
@@ -417,14 +458,16 @@ class StreamingPartitioner:
         print(f"Chunk size: {self.chunk_size:,} rows")
         print(f"{'='*70}\n")
         
+        # Start workers
         self.start_workers()
         
+        # Stream chunks to workers
         chunks_sent = 0
         
         try:
             if use_mmsi_partitioning:
                 chunk_generator = create_mmsi_partitioned_chunks(
-                    filepath,
+                    filepath, 
                     chunk_size=self.chunk_size
                 )
             else:
@@ -438,7 +481,8 @@ class StreamingPartitioner:
                     mem_mb = get_memory_usage_mb()
                     print(f"[Main] Dispatched {chunks_sent} chunks, Memory: {mem_mb:.1f} MB")
                     
-                    if mem_mb > 800:
+                    # Memory safety check
+                    if mem_mb > 800:  # Approaching 1GB limit
                         print("[Main] WARNING: Approaching memory limit, forcing GC")
                         gc.collect()
                         
@@ -447,13 +491,20 @@ class StreamingPartitioner:
         
         print(f"\n[Main] Finished streaming, sent {chunks_sent} chunks")
 
+        # First send poison pills to make workers finish and send results
         self.stop_workers()
+
+        # Now collect results (workers are finishing and sending results)
         aggregated_results = self._aggregate_results()
+
+        # Wait for workers to fully terminate
         self.wait_for_workers()
 
         end_time = time.time()
+        
         elapsed = end_time - start_time
         
+        # Add summary statistics
         aggregated_results['file'] = filepath
         aggregated_results['file_size_gb'] = file_size_gb
         aggregated_results['elapsed_seconds'] = elapsed
@@ -468,69 +519,80 @@ class StreamingPartitioner:
         """Collect and aggregate results from all workers."""
         worker_results = []
         total_records = 0
-        all_anomalies = []
-        all_mmsi_seen: set = set()
-        
+        combined_mmsi_counts: Dict[str, int] = defaultdict(int)
+        all_anomalies: List[Dict[str, Any]] = []
+
         results_received = 0
         while results_received < self.num_workers:
             try:
-                result = self.result_queue.get(timeout=5.0)
+                result = self.result_queue.get(timeout=60.0)
                 worker_results.append(result)
                 total_records += result['total_records']
-                all_anomalies.extend(result['anomalies'])
 
-                # Accumulate unique MMSIs from each anomaly record
-                # (workers already de-duplicate within themselves via mmsi_data keys)
-                for anomaly in result['anomalies']:
-                    all_mmsi_seen.add(anomaly['mmsi'])
+                for mmsi, count in result['mmsi_counts'].items():
+                    combined_mmsi_counts[mmsi] += count
+
+                all_anomalies.extend(result.get('anomalies', []))
 
                 results_received += 1
-                print(f"[Main] Received results from worker {result['worker_id']}: {len(result['anomalies'])} anomalies")
-                    
+                print(
+                    f"[Main] Worker {result['worker_id']} — "
+                    f"{result['total_records']:,} records, "
+                    f"{len(result.get('anomalies', []))} anomalies"
+                )
+
             except Exception as e:
                 print(f"[Main] Timeout waiting for worker results: {e}")
                 break
 
-        # Use the per-worker unique vessel counts, which are now guaranteed
-        unique_vessels = sum(r['unique_vessels'] for r in worker_results)
-
-        dfsi = len(all_anomalies)
-        
         return {
             'worker_results': worker_results,
             'total_records': total_records,
-            'unique_vessels': unique_vessels,
+            'unique_vessels': len(combined_mmsi_counts),
+            'mmsi_counts': dict(combined_mmsi_counts),
             'anomalies': all_anomalies,
-            'total_anomalies': len(all_anomalies),
-            'dfsi': dfsi,
-            'max_memory_mb': max(r['final_memory_mb'] for r in worker_results) if worker_results else 0
+            'max_memory_mb': max(r['final_memory_mb'] for r in worker_results) if worker_results else 0,
         }
     
     def _print_summary(self, results: Dict[str, Any]) -> None:
         """Print a summary of processing results."""
         print(f"\n{'='*70}")
-        print("SHADOW FLEET DETECTION SUMMARY")
+        print("PROCESSING SUMMARY")
         print(f"{'='*70}")
         print(f"File: {os.path.basename(results['file'])}")
         print(f"File size: {results['file_size_gb']:.2f} GB")
         print(f"Total records processed: {results['total_records']:,}")
         print(f"Unique vessels (MMSIs): {results['unique_vessels']:,}")
-        print(f"Total anomalies detected: {results['total_anomalies']:,}")
-        print(f"Shadow Fleet Suspicion Index (DFSI): {results['dfsi']}")
         print(f"Chunks processed: {results['chunks_processed']:,}")
         print(f"Elapsed time: {results['elapsed_seconds']:.2f} seconds")
         print(f"Throughput: {results['throughput_mb_per_sec']:.2f} MB/sec")
         print(f"Peak worker memory: {results['max_memory_mb']:.1f} MB")
         print(f"{'='*70}")
         
-        if results['anomalies']:
-            print("\nSample Anomalies (Going Dark):")
-            print("-" * 70)
-            for i, anomaly in enumerate(results['anomalies'][:5], 1):
-                print(f"  {i}. MMSI {anomaly['mmsi']}: {anomaly['gap_hours']:.1f}h gap, "
-                      f"{anomaly['distance_km']:.2f}km moved")
-                print(f"     From {anomaly['gap_start']} to {anomaly['gap_end']}")
-            if len(results['anomalies']) > 5:
-                print(f"  ... and {len(results['anomalies']) - 5} more anomalies")
+        # Show top 10 most active vessels
+        if results['mmsi_counts']:
+            sorted_vessels = sorted(
+                results['mmsi_counts'].items(),
+                key=lambda x: x[1],
+                reverse=True,
+            )[:10]
+            print("\nTop 10 Most Active Vessels:")
+            print("-" * 40)
+            for i, (mmsi, count) in enumerate(sorted_vessels, 1):
+                print(f"  {i:2}. MMSI {mmsi}: {count:,} records")
 
-
+        # Show going-dark anomalies
+        anomalies = results.get('anomalies', [])
+        print(f"\nGoing-Dark Anomalies Detected: {len(anomalies)}")
+        if anomalies:
+            # Sort by longest gap first
+            top_anomalies = sorted(anomalies, key=lambda a: a['gap_hours'], reverse=True)[:10]
+            print("-" * 60)
+            print(f"  {'MMSI':<12} {'Gap (h)':>8}  {'Distance (km)':>14}  Gap window")
+            print("-" * 60)
+            for a in top_anomalies:
+                print(
+                    f"  {a['mmsi']:<12} {a['gap_hours']:>8.1f}  "
+                    f"{a['distance_km']:>14.1f}  "
+                    f"{a['gap_start']} → {a['gap_end']}"
+                )

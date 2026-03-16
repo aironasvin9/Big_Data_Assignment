@@ -1,8 +1,10 @@
+# Task 1: Low-Memory Parallel Partitioning for Maritime Shadow Fleet Detection
+
 import os
 import multiprocessing as mp
 from collections import defaultdict
 from typing import Dict, Any
-from utilstry import stream_csv_rows, is_valid_mmsi, is_valid_coordinate, StreamingPartitioner
+from utils import stream_csv_rows, is_valid_mmsi, is_valid_coordinate, StreamingPartitioner
 
 
 # CONFIGURATION & CONSTANTS
@@ -10,7 +12,7 @@ from utilstry import stream_csv_rows, is_valid_mmsi, is_valid_coordinate, Stream
 INVALID_MMSI_PATTERNS = {
     '000000000',
     '111111111',
-    '222222222'
+    '222222222',
     '333333333',
     '444444444',
     '555555555',
@@ -147,7 +149,7 @@ def main():
         print(f"  - {f} ({size_gb:.2f} GB)")
     
     print("\n" + "="*70)
-    print("TASK 3: SHADOW FLEET DETECTION ANALYTICS & DFSI")
+    print("TASK 1: LOW-MEMORY PARALLEL PARTITIONING")
     print("="*70)
     
     # Process each file
@@ -164,9 +166,9 @@ def main():
         file_stats = collect_file_statistics(filepath, sample_size=100000)
         print(f"  Sample analysis complete: {file_stats['valid_rows']:,} valid rows in sample")
         
-        # Then run full parallel anomaly detection
+        # Then run full parallel processing
         print(f"\n{'='*70}")
-        print(f"Phase 2: Full Parallel Anomaly Detection for {csv_file}")
+        print(f"Phase 2: Full Parallel Processing for {csv_file}")
         print(f"{'='*70}")
         
         partitioner = StreamingPartitioner(
@@ -176,11 +178,9 @@ def main():
         
         results = partitioner.process_file(filepath, use_mmsi_partitioning=True)
         
-        print(f"\nAnomaly detection completed for {csv_file}")
+        print(f"\nResults saved for {csv_file}")
         print(f"  Total valid records: {results['total_records']:,}")
         print(f"  Unique vessels: {results['unique_vessels']:,}")
-        print(f"  Anomalies detected: {results['total_anomalies']:,}")
-        print(f"  DFSI: {results['dfsi']}")
 
 
 if __name__ == "__main__":
