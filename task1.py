@@ -1,10 +1,8 @@
-# Task 1: Low-Memory Parallel Partitioning for Maritime Shadow Fleet Detection
-
 import os
 import multiprocessing as mp
 from collections import defaultdict
 from typing import Dict, Any
-from utils import stream_csv_rows, is_valid_mmsi, is_valid_coordinate, StreamingPartitioner
+from utilstry import stream_csv_rows, is_valid_mmsi, is_valid_coordinate, StreamingPartitioner
 
 
 # CONFIGURATION & CONSTANTS
@@ -12,6 +10,12 @@ from utils import stream_csv_rows, is_valid_mmsi, is_valid_coordinate, Streaming
 INVALID_MMSI_PATTERNS = {
     '000000000',
     '111111111',
+    '222222222'
+    '333333333',
+    '444444444',
+    '555555555',
+    '666666666',
+    '777777777',
     '123456789',
     '999999999',
     '012345678',
@@ -41,6 +45,7 @@ COL_IMO = 10
 COL_CALLSIGN = 11
 COL_NAME = 12
 COL_SHIP_TYPE = 13
+COL_DRAUGHT = 18
 
 # STATISTICS COLLECTOR (for analysis without full processing)
 # =============================================================================
@@ -126,7 +131,7 @@ def main():
     """Main entry point for Task 1."""
     
     # Configuration - pakeiskite i savo folderi
-    DATA_DIR = "/Users/jekaterinasergejeva/Desktop/Masters/Big Data/assignment1"
+    DATA_DIR = "/mnt/c/Users/Namai/Desktop/VU/2nd_semester/Big_data/project/data"
     
     # Find CSV files
     csv_files = sorted([f for f in os.listdir(DATA_DIR) if f.endswith('.csv')])
@@ -142,7 +147,7 @@ def main():
         print(f"  - {f} ({size_gb:.2f} GB)")
     
     print("\n" + "="*70)
-    print("TASK 1: LOW-MEMORY PARALLEL PARTITIONING")
+    print("TASK 3: SHADOW FLEET DETECTION ANALYTICS & DFSI")
     print("="*70)
     
     # Process each file
@@ -159,9 +164,9 @@ def main():
         file_stats = collect_file_statistics(filepath, sample_size=100000)
         print(f"  Sample analysis complete: {file_stats['valid_rows']:,} valid rows in sample")
         
-        # Then run full parallel processing
+        # Then run full parallel anomaly detection
         print(f"\n{'='*70}")
-        print(f"Phase 2: Full Parallel Processing for {csv_file}")
+        print(f"Phase 2: Full Parallel Anomaly Detection for {csv_file}")
         print(f"{'='*70}")
         
         partitioner = StreamingPartitioner(
@@ -171,9 +176,11 @@ def main():
         
         results = partitioner.process_file(filepath, use_mmsi_partitioning=True)
         
-        print(f"\nResults saved for {csv_file}")
+        print(f"\nAnomaly detection completed for {csv_file}")
         print(f"  Total valid records: {results['total_records']:,}")
         print(f"  Unique vessels: {results['unique_vessels']:,}")
+        print(f"  Anomalies detected: {results['total_anomalies']:,}")
+        print(f"  DFSI: {results['dfsi']}")
 
 
 if __name__ == "__main__":
