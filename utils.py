@@ -83,25 +83,7 @@ def detect_going_dark_anomalies(
     gap_threshold_hours: float = 4.0,
     movement_threshold_km: float = 5.0,
 ) -> List[Dict[str, Any]]:
-    """
-    Detect 'Going Dark' anomalies in a vessel's pre-sorted lightweight records.
-
-    A going-dark event is flagged when:
-      - There is a gap of more than *gap_threshold_hours* between consecutive
-        AIS messages, AND
-      - The haversine distance between the last known position before the gap
-        and the first position after is greater than *movement_threshold_km*,
-        meaning the vessel was not simply sitting at anchor.
-
-    Args:
-        mmsi: Vessel identifier.
-        records: Pre-sorted list of (ts_str, epoch_sec, lat, lon) tuples.
-        gap_threshold_hours: Minimum silence gap to flag (default 4 h).
-        movement_threshold_km: Minimum displacement to flag as movement (default 5 km).
-
-    Returns:
-        List of anomaly dicts, one per detected event.
-    """
+        
     if len(records) < 2:
         return []
 
