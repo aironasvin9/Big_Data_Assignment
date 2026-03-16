@@ -217,11 +217,6 @@ def stream_csv_rows(filepath, skip_header = True) -> Generator[List[str], None, 
 
 
 def stream_valid_rows(filepath, COL_MMSI) -> Generator[Tuple, None, None]:
-    """
-    Generator that streams only valid rows as lightweight 5-tuples
-    (mmsi, ts_str, epoch_sec, lat, lon), skipping invalid records.
-    Numerics are pre-parsed here so workers never re-parse raw CSV text.
-    """
     row_generator = stream_csv_rows(filepath, skip_header=True)
 
     try:
@@ -297,17 +292,7 @@ def worker_process(
     result_queue: Queue,
     stop_flag: Synchronized,
 ) -> None:
-    """
-    Worker process responsible for a disjoint set of MMSIs (guaranteed by
-    hash-based routing in the coordinator).
 
-    Memory-efficient design: stores only (ts_str, epoch_sec, lat, lon) per
-    record — not the full ~20-column CSV row. epoch_sec is a pre-parsed int
-    which makes the sort in Phase 2 a pure integer comparison.
-
-    Phase 1 – Accumulate: receive lightweight records from the coordinator.
-    Phase 2 – Detect:     sort by epoch int, then run going-dark detection.
-    """
     processed_chunks = 0
     total_records = 0
     # Dict[mmsi -> list of (ts_str, epoch_sec, lat, lon)]
