@@ -133,7 +133,7 @@ def main():
     """Main entry point for Task 1."""
     
     # Configuration - pakeiskite i savo folderi
-    DATA_DIR = "/mnt/c/Users/Namai/Desktop/VU/2nd_semester/Big_data/project/data"
+    DATA_DIR = "./data"
     
     # Find CSV files
     csv_files = sorted([f for f in os.listdir(DATA_DIR) if f.endswith('.csv')])
