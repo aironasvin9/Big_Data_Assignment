@@ -52,7 +52,7 @@ if __name__ == "__main__":
     # UPDATE THIS PATH to your actual CSV file location
     # Example: "/Users/jekaterinasergejeva/Desktop/Masters/Big Data/assignment1/aisdk-2024-01-15.csv"
     
-    DATA_DIR = "/Users/jekaterinasergejeva/Desktop/Masters/Big Data/assignment1"
+    DATA_DIR = "./data"
     
     # List available CSV files in directory
     print("Available CSV files in directory:")
