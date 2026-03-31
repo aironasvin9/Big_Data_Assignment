@@ -83,7 +83,7 @@ def detect_going_dark_anomalies(
     gap_threshold_hours: float = 4.0,
     movement_threshold_km: float = 5.0,
 ) -> List[Dict[str, Any]]:
-        
+
     if len(records) < 2:
         return []
 
@@ -114,6 +114,49 @@ def detect_going_dark_anomalies(
 
     return anomalies
 
+# AIRONAS addition
+# Anomaly D
+
+def detect_teleportation_anomalies(
+        mmsi: str,
+        records: List[Tuple],
+        speed_threshold_knots: float = 60.0,
+) -> List[Dict[str, Any]]:
+    """
+    Detect impossible vessel movements (identity cloning / teleportation)
+    """
+    if len(records) < 2:
+        return []
+
+    anomalies = []
+
+    for i in range(1, len(records)):
+        prev_ts_str, prev_epoch, prev_lat, prev_lon = records[i - 1]
+        curr_ts_str, curr_epoch, curr_lat, curr_lon = records[i]
+
+        time_sec = curr_epoch - prev_epoch
+        if time_sec <= 0:
+            continue
+        # Distance in km
+        dist_km = haversine_distance(prev_lat, prev_lon, curr_lat, curr_lon)
+
+        # Convert to speed (knots)
+        speed_kmh = dist_km / (time_sec / 3600.0)
+        speed_knots = speed_kmh / 1.852 # km/h -> knots
+
+        if speed_knots > speed_threshold_knots:
+            anomalies.append({
+                'mmsi': mmsi,
+                'timestamp_prev': prev_ts_str,
+                'timestamp_curr': curr_ts_str,
+                'distance_km': round(dist_km, 2),
+                'speed_knots': round(speed_knots, 2),
+                'pos_prev': (prev_lat, prev_lon),
+                'pos_curr': (curr_lat, curr_lon),
+                'anomaly_type': 'teleportation',
+            })
+
+return anomalies
 
 # MEMORY MONITORING UTILITIES
 
@@ -138,25 +181,25 @@ def is_valid_mmsi(mmsi, EXPECTED_MMSI_LENGTH, INVALID_MMSI_PATTERNS, INVALID_MMS
     """
 
     mmsi = mmsi.strip()
-    
+
     if not mmsi:
         return False
-    
+
     if not mmsi.isdigit():
         return False
-    
+
     if len(mmsi) != EXPECTED_MMSI_LENGTH:
         return False
-    
+
     if mmsi in INVALID_MMSI_PATTERNS:
         return False
-    
+
     if mmsi.startswith(INVALID_MMSI_PREFIXES):
         return False
-    
+
     if len(set(mmsi)) == 1:
         return False
-    
+
     return True
 
 def is_valid_coordinate(lat, lon):
@@ -166,33 +209,33 @@ def is_valid_coordinate(lat, lon):
     try:
         lat_f = float(lat)
         lon_f = float(lon)
-        
+
         if not (-90 <= lat_f <= 90):
             return False
         if not (-180 <= lon_f <= 180):
             return False
-        
+
         if lat_f == 0.0 and lon_f == 0.0:
             return False
-            
+
         return True
     except (ValueError, TypeError):
         return False
-    
+
 def validate_row(row, COL_MMSI, COL_LATITUDE, COL_LONGITUDE):
     """
     Validate a complete row of AIS data.
     """
-    
+
     mmsi = row[COL_MMSI] if len(row) > COL_MMSI else ""
     if not is_valid_mmsi(mmsi, EXPECTED_MMSI_LENGTH, INVALID_MMSI_PATTERNS, INVALID_MMSI_PREFIXES):
         return False
-    
+
     lat = row[COL_LATITUDE] if len(row) > COL_LATITUDE else ""
     lon = row[COL_LONGITUDE] if len(row) > COL_LONGITUDE else ""
     if not is_valid_coordinate(lat, lon):
         return False
-    
+
     return True
 
 
@@ -204,14 +247,14 @@ def stream_csv_rows(filepath, skip_header = True) -> Generator[List[str], None, 
     """
     with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
         reader = csv.reader(f)
-        
+
         if skip_header:
             try:
                 header = next(reader)
                 yield header
             except StopIteration:
                 return
-        
+
         for row in reader:
             yield row
 
@@ -333,7 +376,11 @@ def worker_process(
             continue
         # Sort by pre-parsed integer epoch — no datetime parsing needed here
         records.sort(key=lambda r: r[1])
+        # Going dark (A)
         all_anomalies.extend(detect_going_dark_anomalies(mmsi, records))
+
+        # Teleportation (D) (AIRONAS ADDITION)
+        all_anomalies.extend(detect_teleportation_anomalies(mmsi, records))
 
     result_queue.put({
         'worker_id': worker_id,
@@ -402,7 +449,7 @@ class StreamingPartitioner:
 
         for worker_id, sub_chunk in worker_chunks.items():
             self.worker_queues[worker_id].put(dict(sub_chunk))
-    
+
     def wait_for_workers(self) -> None:
         """Wait for all workers to finish."""
         for worker in self.workers:
@@ -410,52 +457,52 @@ class StreamingPartitioner:
             if worker.is_alive():
                 worker.terminate()
         self.workers = []
-    
+
     def process_file(self, filepath: str, use_mmsi_partitioning: bool = True) -> Dict[str, Any]:
         """
         Process a CSV file using parallel workers.
         """
         start_time = time.time()
         file_size_gb = os.path.getsize(filepath) / (1024**3)
-        
+
         print(f"\n{'='*70}")
         print(f"Processing: {os.path.basename(filepath)}")
         print(f"File size: {file_size_gb:.2f} GB")
         print(f"Workers: {self.num_workers}")
         print(f"Chunk size: {self.chunk_size:,} rows")
         print(f"{'='*70}\n")
-        
+
         # Start workers
         self.start_workers()
-        
+
         # Stream chunks to workers
         chunks_sent = 0
-        
+
         try:
             if use_mmsi_partitioning:
                 chunk_generator = create_mmsi_partitioned_chunks(
-                    filepath, 
+                    filepath,
                     chunk_size=self.chunk_size
                 )
             else:
                 chunk_generator = create_chunks(filepath, chunk_size=self.chunk_size)
-            
+
             for chunk in chunk_generator:
                 self._route_chunk(chunk)
                 chunks_sent += 1
-                
+
                 if chunks_sent % 100 == 0:
                     mem_mb = get_memory_usage_mb()
                     print(f"[Main] Dispatched {chunks_sent} chunks, Memory: {mem_mb:.1f} MB")
-                    
+
                     # Memory safety check
                     if mem_mb > 800:  # Approaching 1GB limit
                         print("[Main] WARNING: Approaching memory limit, forcing GC")
                         gc.collect()
-                        
+
         except KeyboardInterrupt:
             print("\n[Main] Interrupted by user")
-        
+
         print(f"\n[Main] Finished streaming, sent {chunks_sent} chunks")
 
         # First send poison pills to make workers finish and send results
@@ -468,20 +515,20 @@ class StreamingPartitioner:
         self.wait_for_workers()
 
         end_time = time.time()
-        
+
         elapsed = end_time - start_time
-        
+
         # Add summary statistics
         aggregated_results['file'] = filepath
         aggregated_results['file_size_gb'] = file_size_gb
         aggregated_results['elapsed_seconds'] = elapsed
         aggregated_results['chunks_processed'] = chunks_sent
         aggregated_results['throughput_mb_per_sec'] = (file_size_gb * 1024) / elapsed if elapsed > 0 else 0
-        
+
         self._print_summary(aggregated_results)
-        
+
         return aggregated_results
-    
+
     def _aggregate_results(self) -> Dict[str, Any]:
         """Collect and aggregate results from all workers."""
         worker_results = []
@@ -520,7 +567,7 @@ class StreamingPartitioner:
             'anomalies': all_anomalies,
             'max_memory_mb': max(r['final_memory_mb'] for r in worker_results) if worker_results else 0,
         }
-    
+
     def _print_summary(self, results: Dict[str, Any]) -> None:
         """Print a summary of processing results."""
         print(f"\n{'='*70}")
@@ -535,7 +582,7 @@ class StreamingPartitioner:
         print(f"Throughput: {results['throughput_mb_per_sec']:.2f} MB/sec")
         print(f"Peak worker memory: {results['max_memory_mb']:.1f} MB")
         print(f"{'='*70}")
-        
+
         # Show top 10 most active vessels
         if results['mmsi_counts']:
             sorted_vessels = sorted(
