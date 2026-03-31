@@ -156,7 +156,7 @@ def detect_teleportation_anomalies(
                 'anomaly_type': 'teleportation',
             })
 
-return anomalies
+    return anomalies
 
 # MEMORY MONITORING UTILITIES
 
