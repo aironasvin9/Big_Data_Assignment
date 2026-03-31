@@ -51,7 +51,9 @@ COL_NAME = 12
 COL_SHIP_TYPE = 13
 COL_DRAUGHT = 18
 
+# ============================================================================
 # ANOMALY DETECTION HELPERS
+# ============================================================================
 
 def parse_timestamp(ts_str: str) -> datetime.datetime:
     """Parse AIS timestamp in format DD/MM/YYYY HH:MM:SS."""
@@ -83,15 +85,27 @@ def detect_going_dark_anomalies(
     gap_threshold_hours: float = 4.0,
     movement_threshold_km: float = 5.0,
 ) -> List[Dict[str, Any]]:
-
+    """
+    Anomaly A: Detect AIS gaps >4 hours where vessel moved >5km (not anchored).
+    
+    Args:
+        mmsi: Vessel MMSI
+        records: List of (ts_str, epoch, lat, lon, sog, draught) tuples
+        gap_threshold_hours: Minimum gap duration (default 4 hours)
+        movement_threshold_km: Minimum movement to flag (default 5 km)
+    
+    Returns:
+        List of going-dark anomalies
+    """
     if len(records) < 2:
         return []
 
     anomalies = []
     gap_threshold_sec = gap_threshold_hours * 3600
+    
     for i in range(1, len(records)):
-        prev_ts_str, prev_epoch, prev_lat, prev_lon = records[i - 1]
-        curr_ts_str, curr_epoch, curr_lat, curr_lon = records[i]
+        prev_ts_str, prev_epoch, prev_lat, prev_lon, _, _ = records[i - 1]
+        curr_ts_str, curr_epoch, curr_lat, curr_lon, _, _ = records[i]
 
         gap_sec = curr_epoch - prev_epoch
         if gap_sec <= gap_threshold_sec:
@@ -114,16 +128,22 @@ def detect_going_dark_anomalies(
 
     return anomalies
 
-# AIRONAS addition
-# Anomaly D
 
 def detect_teleportation_anomalies(
-        mmsi: str,
-        records: List[Tuple],
-        speed_threshold_knots: float = 60.0,
+    mmsi: str,
+    records: List[Tuple],
+    speed_threshold_knots: float = 60.0,
 ) -> List[Dict[str, Any]]:
     """
-    Detect impossible vessel movements (identity cloning / teleportation)
+    Anomaly D: Detect impossible vessel movements (identity cloning / teleportation).
+    
+    Args:
+        mmsi: Vessel MMSI
+        records: List of (ts_str, epoch, lat, lon, sog, draught) tuples
+        speed_threshold_knots: Maximum realistic speed (default 60 knots)
+    
+    Returns:
+        List of teleportation anomalies
     """
     if len(records) < 2:
         return []
@@ -131,18 +151,19 @@ def detect_teleportation_anomalies(
     anomalies = []
 
     for i in range(1, len(records)):
-        prev_ts_str, prev_epoch, prev_lat, prev_lon = records[i - 1]
-        curr_ts_str, curr_epoch, curr_lat, curr_lon = records[i]
+        prev_ts_str, prev_epoch, prev_lat, prev_lon, _, _ = records[i - 1]
+        curr_ts_str, curr_epoch, curr_lat, curr_lon, _, _ = records[i]
 
         time_sec = curr_epoch - prev_epoch
         if time_sec <= 0:
             continue
+        
         # Distance in km
         dist_km = haversine_distance(prev_lat, prev_lon, curr_lat, curr_lon)
 
         # Convert to speed (knots)
         speed_kmh = dist_km / (time_sec / 3600.0)
-        speed_knots = speed_kmh / 1.852 # km/h -> knots
+        speed_knots = speed_kmh / 1.852  # km/h -> knots
 
         if speed_knots > speed_threshold_knots:
             anomalies.append({
@@ -150,6 +171,7 @@ def detect_teleportation_anomalies(
                 'gap_start': prev_ts_str,
                 'gap_end': curr_ts_str,
                 'distance_km': round(dist_km, 2),
+                'distance_nm': round(dist_km / 1.852, 2),
                 'speed_knots': round(speed_knots, 2),
                 'pos_prev': (prev_lat, prev_lon),
                 'pos_curr': (curr_lat, curr_lon),
@@ -158,327 +180,22 @@ def detect_teleportation_anomalies(
 
     return anomalies
 
-# MEMORY MONITORING UTILITIES
 
-def get_memory_usage_mb():
-    """Get current memory usage in MB (macOS/Linux)."""
-    try:
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        return usage.ru_maxrss / (1024 * 1024)  # Convert to MB on macOS
-    except Exception:
-        return 0.0
-
-
-def check_memory_limit(limit_mb = 1000.0):
-    """Check if memory usage is under the limit (default 1GB)."""
-    current = get_memory_usage_mb()
-    return current < limit_mb
-
-# DATA VALIDATION & FILTERING
-def is_valid_mmsi(mmsi, EXPECTED_MMSI_LENGTH, INVALID_MMSI_PATTERNS, INVALID_MMSI_PREFIXES):
-    """
-    Check wether MMSI code is valid according to standard rules.
-    """
-
-    mmsi = mmsi.strip()
-
-    if not mmsi:
-        return False
-
-    if not mmsi.isdigit():
-        return False
-
-    if len(mmsi) != EXPECTED_MMSI_LENGTH:
-        return False
-
-    if mmsi in INVALID_MMSI_PATTERNS:
-        return False
-
-    if mmsi.startswith(INVALID_MMSI_PREFIXES):
-        return False
-
-    if len(set(mmsi)) == 1:
-        return False
-
-    return True
-
-def is_valid_coordinate(lat, lon):
-    """
-    Validate latitude and longitude values.
-    """
-    try:
-        lat_f = float(lat)
-        lon_f = float(lon)
-
-        if not (-90 <= lat_f <= 90):
-            return False
-        if not (-180 <= lon_f <= 180):
-            return False
-
-        if lat_f == 0.0 and lon_f == 0.0:
-            return False
-
-        return True
-    except (ValueError, TypeError):
-        return False
-
-def validate_row(row, COL_MMSI, COL_LATITUDE, COL_LONGITUDE):
-    """
-    Validate a complete row of AIS data.
-    """
-
-    mmsi = row[COL_MMSI] if len(row) > COL_MMSI else ""
-    if not is_valid_mmsi(mmsi, EXPECTED_MMSI_LENGTH, INVALID_MMSI_PATTERNS, INVALID_MMSI_PREFIXES):
-        return False
-
-    lat = row[COL_LATITUDE] if len(row) > COL_LATITUDE else ""
-    lon = row[COL_LONGITUDE] if len(row) > COL_LONGITUDE else ""
-    if not is_valid_coordinate(lat, lon):
-        return False
-
-    return True
-
-
-# STREAMING DATA GENERATOR
-
-def stream_csv_rows(filepath, skip_header = True) -> Generator[List[str], None, None]:
-    """
-    Generator that streams CSV rows one at a time without loading entire file.
-    """
-    with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-        reader = csv.reader(f)
-
-        if skip_header:
-            try:
-                header = next(reader)
-                yield header
-            except StopIteration:
-                return
-
-        for row in reader:
-            yield row
-
-
-def stream_valid_rows(filepath, COL_MMSI) -> Generator[Tuple, None, None]:
-    """
-    Generator that streams valid rows with extended data.
-    Yields: (mmsi, ts_str, epoch, lat, lon, sog, draught, raw_row)
-    """
-    row_generator = stream_csv_rows(filepath, skip_header=True)
-
-    try:
-        _header = next(row_generator)
-    except StopIteration:
-        return
-
-    for row in row_generator:
-        if not validate_row(row, COL_MMSI, COL_LATITUDE, COL_LONGITUDE):
-            continue
-        
-        mmsi = row[COL_MMSI].strip()
-        try:
-            ts_str = row[COL_TIMESTAMP]
-            epoch = ts_to_epoch(ts_str)
-            lat = float(row[COL_LATITUDE])
-            lon = float(row[COL_LONGITUDE])
-            
-            # Extract SOG (Speed Over Ground) and Draught
-            sog = 0.0
-            if len(row) > COL_SOG:
-                try:
-                    sog = float(row[COL_SOG])
-                except (ValueError, TypeError):
-                    sog = 0.0
-            
-            draught = 0.0
-            if len(row) > COL_DRAUGHT:
-                try:
-                    draught = float(row[COL_DRAUGHT])
-                except (ValueError, TypeError):
-                    draught = 0.0
-            
-        except (ValueError, IndexError):
-            continue
-        
-        yield (mmsi, ts_str, epoch, lat, lon, sog, draught)
-
-
-# CHUNK PARTITIONING
-def create_chunks(filepath, chunk_size) -> Generator[List[Tuple], None, None]:
-    """
-    Generator that creates flat chunks of lightweight records.
-    Each item: (mmsi, ts_str, epoch_sec, lat, lon).
-    """
-    chunk = []
-
-    for record in stream_valid_rows(filepath, COL_MMSI):
-        chunk.append(record)
-        if len(chunk) >= chunk_size:
-            yield chunk
-            chunk = []
-            gc.collect()
-
-    if chunk:
-        yield chunk
-
-
-def create_mmsi_partitioned_chunks(filepath, chunk_size, max_mmsi_per_chunk=100) -> Generator[Dict[str, List[Tuple]], None, None]:
-    """
-    Generator that creates MMSI-partitioned chunks for parallel processing.
-    Each chunk: {mmsi: [(ts_str, epoch_sec, lat, lon), ...], ...}
-    At most max_mmsi_per_chunk distinct vessels appear in each yielded dict.
-    """
-    current_chunk: Dict[str, List] = defaultdict(list)
-    current_size = 0
-    current_mmsi_count = 0
-
-    for mmsi, ts_str, epoch, lat, lon in stream_valid_rows(filepath, COL_MMSI):
-        if mmsi not in current_chunk:
-            current_mmsi_count += 1
-        current_chunk[mmsi].append((ts_str, epoch, lat, lon))
-        current_size += 1
-
-        if current_size >= chunk_size or current_mmsi_count >= max_mmsi_per_chunk:
-            yield dict(current_chunk)
-            current_chunk = defaultdict(list)
-            current_size = 0
-            current_mmsi_count = 0
-            gc.collect()
-
-    if current_chunk:
-        yield dict(current_chunk)
-
-
-# PARALLEL WORKERS FUNCTIONS
-
-def worker_process(
-    worker_id: int,
-    task_queue: Queue,
-    result_queue: Queue,
-    stop_flag: Synchronized,
-) -> None:
-
-    processed_chunks = 0
-    total_records = 0
-    # Dict[mmsi -> list of (ts_str, epoch_sec, lat, lon)]
-    mmsi_data: Dict[str, List[Tuple]] = defaultdict(list)
-
-    print(f"[Worker {worker_id}] Started")
-    
-def detect_loitering_anomalies(
-    vessel_pairs: List[Tuple[str, str]],
-    mmsi_records: Dict[str, List[Tuple]],
-    proximity_threshold_km: float = 0.5,  # 500 meters
-    sog_threshold_knots: float = 1.0,
-    loitering_duration_hours: float = 2.0,
-) -> List[Dict[str, Any]]:
-    """
-    Detect two distinct vessels (different MMSIs) in close proximity with low speed.
-    
-    Args:
-        vessel_pairs: List of (mmsi1, mmsi2) tuples to check
-        mmsi_records: Dict mapping mmsi -> [(ts_str, epoch, lat, lon, sog, draught), ...]
-        proximity_threshold_km: Distance threshold (default 500m = 0.5km)
-        sog_threshold_knots: Speed threshold (default 1 knot)
-        loitering_duration_hours: Minimum loitering duration
-    
-    Returns:
-        List of loitering anomalies
-    """
-    anomalies = []
-    loitering_sec = loitering_duration_hours * 3600
-    
-    for mmsi1, mmsi2 in vessel_pairs:
-        if mmsi1 not in mmsi_records or mmsi2 not in mmsi_records:
-            continue
-        
-        records1 = mmsi_records[mmsi1]
-        records2 = mmsi_records[mmsi2]
-        
-        if len(records1) < 2 or len(records2) < 2:
-            continue
-        
-        # Find overlapping time windows
-        min_time = max(records1[0][1], records2[0][1])  # min epoch
-        max_time = min(records1[-1][1], records2[-1][1])  # max epoch
-        
-        if max_time - min_time < loitering_sec:
-            continue
-        
-        # Check for sustained proximity and low speed
-        suspicious_window_start = None
-        suspicious_window_end = None
-        
-        for i in range(len(records1)):
-            ts1, epoch1, lat1, lon1, sog1, _ = records1[i]
-            
-            # Skip if vessel 1 is moving too fast
-            if sog1 > sog_threshold_knots:
-                if suspicious_window_start is not None:
-                    # End current suspicious window
-                    duration_sec = suspicious_window_end - suspicious_window_start
-                    if duration_sec >= loitering_sec:
-                        anomalies.append({
-                            'mmsi_vessel1': mmsi1,
-                            'mmsi_vessel2': mmsi2,
-                            'window_start': records1[suspicious_window_start][0],
-                            'window_end': records1[suspicious_window_end][0],
-                            'duration_hours': round(duration_sec / 3600.0, 2),
-                            'avg_distance_km': 0.0,  # Simplified
-                            'anomaly_type': 'loitering',
-                        })
-                    suspicious_window_start = None
-                continue
-            
-            # Find closest record from vessel 2 within ±30 minutes
-            closest_record2 = None
-            closest_distance = float('inf')
-            
-            for j in range(len(records2)):
-                ts2, epoch2, lat2, lon2, sog2, _ = records2[j]
-                
-                # Time window check: within 30 minutes
-                if abs(epoch1 - epoch2) > 1800:
-                    continue
-                
-                # Speed check: both must be slow
-                if sog2 > sog_threshold_knots:
-                    continue
-                
-                # Distance check
-                dist = haversine_distance(lat1, lon1, lat2, lon2)
-                if dist < closest_distance:
-                    closest_distance = dist
-                    closest_record2 = (ts2, epoch2, lat2, lon2)
-            
-            # If found a close, slow vessel 2
-            if closest_distance < proximity_threshold_km and closest_record2 is not None:
-                if suspicious_window_start is None:
-                    suspicious_window_start = i
-                suspicious_window_end = i
-            else:
-                if suspicious_window_start is not None and \
-                   (suspicious_window_end - suspicious_window_start) >= loitering_sec // 10:
-                    # Reset window
-                    suspicious_window_start = None
-    
-    return anomalies
-
-    def detect_draft_change_anomalies(
+def detect_draft_change_anomalies(
     mmsi: str,
     records: List[Tuple],
     gap_threshold_hours: float = 2.0,
     draft_change_percent_threshold: float = 5.0,
 ) -> List[Dict[str, Any]]:
     """
-    Detect vessels whose draught (depth in water) changes by >5% during AIS blackouts.
+    Anomaly C: Detect vessels whose draught changes >5% during AIS blackouts >2 hours.
     This implies cargo was loaded/unloaded illegally.
     
     Args:
         mmsi: Vessel MMSI
         records: List of (ts_str, epoch, lat, lon, sog, draught) tuples
-        gap_threshold_hours: Minimum blackout duration
-        draft_change_percent_threshold: Minimum % change to flag
+        gap_threshold_hours: Minimum blackout duration (default 2 hours)
+        draft_change_percent_threshold: Minimum % change to flag (default 5%)
     
     Returns:
         List of draft change anomalies
@@ -520,7 +237,98 @@ def detect_loitering_anomalies(
     
     return anomalies
 
-    def calculate_dfsi(mmsi: str, anomalies_for_vessel: List[Dict[str, Any]]) -> float:
+
+def detect_loitering_anomalies(
+    mmsi_records: Dict[str, List[Tuple]],
+    proximity_threshold_km: float = 0.5,
+    sog_threshold_knots: float = 1.0,
+    loitering_duration_hours: float = 2.0,
+) -> List[Dict[str, Any]]:
+    """
+    Anomaly B: Detect two distinct vessels within 500m of each other with SOG <1 knot for >2 hours.
+    
+    This is a post-processing step that compares all vessel pairs globally.
+    
+    Args:
+        mmsi_records: Dict mapping mmsi -> [(ts_str, epoch, lat, lon, sog, draught), ...]
+        proximity_threshold_km: Distance threshold (default 500m = 0.5km)
+        sog_threshold_knots: Speed threshold (default 1 knot)
+        loitering_duration_hours: Minimum loitering duration (default 2 hours)
+    
+    Returns:
+        List of loitering anomalies
+    """
+    anomalies = []
+    loitering_sec = loitering_duration_hours * 3600
+    mmsi_list = sorted(mmsi_records.keys())
+    
+    # Check all pairs of vessels
+    for idx1 in range(len(mmsi_list)):
+        for idx2 in range(idx1 + 1, len(mmsi_list)):
+            mmsi1 = mmsi_list[idx1]
+            mmsi2 = mmsi_list[idx2]
+            
+            records1 = mmsi_records[mmsi1]
+            records2 = mmsi_records[mmsi2]
+            
+            if len(records1) < 2 or len(records2) < 2:
+                continue
+            
+            # Find overlapping time windows
+            min_time = max(records1[0][1], records2[0][1])
+            max_time = min(records1[-1][1], records2[-1][1])
+            
+            if max_time - min_time < loitering_sec:
+                continue
+            
+            # Check for sustained proximity and low speed
+            close_count = 0
+            close_times = []
+            
+            for rec1 in records1:
+                ts1, epoch1, lat1, lon1, sog1, _ = rec1
+                
+                # Skip if vessel 1 is moving too fast
+                if sog1 > sog_threshold_knots:
+                    continue
+                
+                # Find closest record from vessel 2 within ±30 minutes
+                for rec2 in records2:
+                    ts2, epoch2, lat2, lon2, sog2, _ = rec2
+                    
+                    # Time window check: within 30 minutes
+                    if abs(epoch1 - epoch2) > 1800:
+                        continue
+                    
+                    # Speed check: both must be slow
+                    if sog2 > sog_threshold_knots:
+                        continue
+                    
+                    # Distance check
+                    dist = haversine_distance(lat1, lon1, lat2, lon2)
+                    if dist < proximity_threshold_km:
+                        close_count += 1
+                        close_times.append(epoch1)
+                        break
+            
+            # Flag if sustained proximity detected
+            if close_count >= 3:  # At least 3 instances of close proximity
+                anomalies.append({
+                    'mmsi_vessel1': mmsi1,
+                    'mmsi_vessel2': mmsi2,
+                    'proximity_events': close_count,
+                    'proximity_threshold_km': proximity_threshold_km,
+                    'anomaly_type': 'loitering',
+                })
+    
+    return anomalies
+
+
+# ============================================================================
+# DFSI CALCULATION
+# ============================================================================
+
+def calculate_dfsi(mmsi: str, anomalies_for_vessel: List[Dict[str, Any]]) -> float:
     """
     Calculate Dynamic Fictional Suspicion Index (DFSI) for a vessel.
     
@@ -539,7 +347,6 @@ def detect_loitering_anomalies(
     Returns:
         DFSI score (float)
     """
-    
     # Extract anomaly-specific data
     going_dark_anomalies = [a for a in anomalies_for_vessel if a.get('anomaly_type') == 'going_dark']
     teleportation_anomalies = [a for a in anomalies_for_vessel if a.get('anomaly_type') == 'teleportation']
@@ -553,9 +360,9 @@ def detect_loitering_anomalies(
     # Component 2: Total impossible distance in nautical miles
     total_impossible_distance_nm = 0.0
     if teleportation_anomalies:
-        # Convert km to nautical miles (1 NM = 1.852 km)
+        # Use pre-calculated distance_nm if available, otherwise convert
         total_impossible_distance_nm = sum(
-            a['distance_km'] / 1.852 for a in teleportation_anomalies
+            a.get('distance_nm', a['distance_km'] / 1.852) for a in teleportation_anomalies
         )
     
     # Component 3: Count of draft changes
@@ -581,7 +388,6 @@ def aggregate_anomalies_by_vessel(all_anomalies: List[Dict[str, Any]]) -> Dict[s
             'dfsi': float
         }
     """
-    
     vessels_dict: Dict[str, Dict] = defaultdict(lambda: {
         'anomalies': [],
         'anomaly_counts': defaultdict(int),
@@ -618,7 +424,6 @@ def rank_vessels_by_dfsi(vessels_dict: Dict[str, Dict], top_n: int = 50) -> List
     Returns:
         List of vessels sorted by DFSI (descending), with all anomaly details
     """
-    
     ranked_vessels = []
     for mmsi, vessel_data in vessels_dict.items():
         ranked_vessels.append({
@@ -634,6 +439,232 @@ def rank_vessels_by_dfsi(vessels_dict: Dict[str, Dict], top_n: int = 50) -> List
     
     return ranked_vessels[:top_n]
 
+
+# ============================================================================
+# MEMORY MONITORING UTILITIES
+# ============================================================================
+
+def get_memory_usage_mb():
+    """Get current memory usage in MB (macOS/Linux)."""
+    try:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        return usage.ru_maxrss / (1024 * 1024)  # Convert to MB on macOS
+    except Exception:
+        return 0.0
+
+
+def check_memory_limit(limit_mb=1000.0):
+    """Check if memory usage is under the limit (default 1GB)."""
+    current = get_memory_usage_mb()
+    return current < limit_mb
+
+
+# ============================================================================
+# DATA VALIDATION & FILTERING
+# ============================================================================
+
+def is_valid_mmsi(mmsi, EXPECTED_MMSI_LENGTH, INVALID_MMSI_PATTERNS, INVALID_MMSI_PREFIXES):
+    """
+    Check whether MMSI code is valid according to standard rules.
+    """
+    mmsi = mmsi.strip()
+
+    if not mmsi:
+        return False
+
+    if not mmsi.isdigit():
+        return False
+
+    if len(mmsi) != EXPECTED_MMSI_LENGTH:
+        return False
+
+    if mmsi in INVALID_MMSI_PATTERNS:
+        return False
+
+    if mmsi.startswith(INVALID_MMSI_PREFIXES):
+        return False
+
+    if len(set(mmsi)) == 1:
+        return False
+
+    return True
+
+
+def is_valid_coordinate(lat, lon):
+    """
+    Validate latitude and longitude values.
+    """
+    try:
+        lat_f = float(lat)
+        lon_f = float(lon)
+
+        if not (-90 <= lat_f <= 90):
+            return False
+        if not (-180 <= lon_f <= 180):
+            return False
+
+        if lat_f == 0.0 and lon_f == 0.0:
+            return False
+
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def validate_row(row, COL_MMSI, COL_LATITUDE, COL_LONGITUDE):
+    """
+    Validate a complete row of AIS data.
+    """
+    mmsi = row[COL_MMSI] if len(row) > COL_MMSI else ""
+    if not is_valid_mmsi(mmsi, EXPECTED_MMSI_LENGTH, INVALID_MMSI_PATTERNS, INVALID_MMSI_PREFIXES):
+        return False
+
+    lat = row[COL_LATITUDE] if len(row) > COL_LATITUDE else ""
+    lon = row[COL_LONGITUDE] if len(row) > COL_LONGITUDE else ""
+    if not is_valid_coordinate(lat, lon):
+        return False
+
+    return True
+
+
+# ============================================================================
+# STREAMING DATA GENERATOR
+# ============================================================================
+
+def stream_csv_rows(filepath, skip_header=True) -> Generator[List[str], None, None]:
+    """
+    Generator that streams CSV rows one at a time without loading entire file.
+    """
+    with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+        reader = csv.reader(f)
+
+        if skip_header:
+            try:
+                header = next(reader)
+                yield header
+            except StopIteration:
+                return
+
+        for row in reader:
+            yield row
+
+
+def stream_valid_rows(filepath, COL_MMSI) -> Generator[Tuple, None, None]:
+    """
+    Generator that streams valid rows with extended data.
+    Yields: (mmsi, ts_str, epoch, lat, lon, sog, draught)
+    """
+    row_generator = stream_csv_rows(filepath, skip_header=True)
+
+    try:
+        _header = next(row_generator)
+    except StopIteration:
+        return
+
+    for row in row_generator:
+        if not validate_row(row, COL_MMSI, COL_LATITUDE, COL_LONGITUDE):
+            continue
+        
+        mmsi = row[COL_MMSI].strip()
+        try:
+            ts_str = row[COL_TIMESTAMP]
+            epoch = ts_to_epoch(ts_str)
+            lat = float(row[COL_LATITUDE])
+            lon = float(row[COL_LONGITUDE])
+            
+            # Extract SOG (Speed Over Ground) and Draught
+            sog = 0.0
+            if len(row) > COL_SOG:
+                try:
+                    sog = float(row[COL_SOG])
+                except (ValueError, TypeError):
+                    sog = 0.0
+            
+            draught = 0.0
+            if len(row) > COL_DRAUGHT:
+                try:
+                    draught = float(row[COL_DRAUGHT])
+                except (ValueError, TypeError):
+                    draught = 0.0
+            
+        except (ValueError, IndexError):
+            continue
+        
+        yield (mmsi, ts_str, epoch, lat, lon, sog, draught)
+
+
+# ============================================================================
+# CHUNK PARTITIONING
+# ============================================================================
+
+def create_chunks(filepath, chunk_size) -> Generator[List[Tuple], None, None]:
+    """
+    Generator that creates flat chunks of lightweight records.
+    Each item: (mmsi, ts_str, epoch_sec, lat, lon, sog, draught).
+    """
+    chunk = []
+
+    for record in stream_valid_rows(filepath, COL_MMSI):
+        chunk.append(record)
+        if len(chunk) >= chunk_size:
+            yield chunk
+            chunk = []
+            gc.collect()
+
+    if chunk:
+        yield chunk
+
+
+def create_mmsi_partitioned_chunks(filepath, chunk_size, max_mmsi_per_chunk=100) -> Generator[Dict[str, List[Tuple]], None, None]:
+    """
+    Generator that creates MMSI-partitioned chunks for parallel processing.
+    Each chunk: {mmsi: [(ts_str, epoch_sec, lat, lon, sog, draught), ...], ...}
+    At most max_mmsi_per_chunk distinct vessels appear in each yielded dict.
+    """
+    current_chunk: Dict[str, List] = defaultdict(list)
+    current_size = 0
+    current_mmsi_count = 0
+
+    for mmsi, ts_str, epoch, lat, lon, sog, draught in stream_valid_rows(filepath, COL_MMSI):
+        if mmsi not in current_chunk:
+            current_mmsi_count += 1
+        current_chunk[mmsi].append((ts_str, epoch, lat, lon, sog, draught))
+        current_size += 1
+
+        if current_size >= chunk_size or current_mmsi_count >= max_mmsi_per_chunk:
+            yield dict(current_chunk)
+            current_chunk = defaultdict(list)
+            current_size = 0
+            current_mmsi_count = 0
+            gc.collect()
+
+    if current_chunk:
+        yield dict(current_chunk)
+
+
+# ============================================================================
+# PARALLEL WORKERS FUNCTIONS
+# ============================================================================
+
+def worker_process(
+    worker_id: int,
+    task_queue: Queue,
+    result_queue: Queue,
+    stop_flag: Synchronized,
+) -> None:
+    """
+    Worker process that accumulates records and detects anomalies.
+    
+    Phase 1: Accumulate all records for each MMSI
+    Phase 2: Sort by timestamp and detect all anomalies
+    """
+    processed_chunks = 0
+    total_records = 0
+    # Dict[mmsi -> list of (ts_str, epoch_sec, lat, lon, sog, draught)]
+    mmsi_data: Dict[str, List[Tuple]] = defaultdict(list)
+
+    print(f"[Worker {worker_id}] Started")
+
     # ----- Phase 1: accumulate ------------------------------------------------
     while not stop_flag.value:
         try:
@@ -642,7 +673,7 @@ def rank_vessels_by_dfsi(vessels_dict: Dict[str, Dict], top_n: int = 50) -> List
             if chunk is None:  # Poison pill
                 break
 
-            # chunk is always a dict {mmsi: [(ts_str, epoch, lat, lon), ...]}
+            # chunk is a dict {mmsi: [(ts_str, epoch, lat, lon, sog, draught), ...]}
             for mmsi, records in chunk.items():
                 mmsi_data[mmsi].extend(records)
                 total_records += len(records)
@@ -660,7 +691,7 @@ def rank_vessels_by_dfsi(vessels_dict: Dict[str, Dict], top_n: int = 50) -> List
                 print(f"[Worker {worker_id}] Error: {e}")
             continue
 
-        # ----- Phase 2: sort + detect anomalies -----------------------------------
+    # ----- Phase 2: sort + detect anomalies -----------------------------------
     all_anomalies: List[Dict[str, Any]] = []
     for mmsi, records in mmsi_data.items():
         if len(records) < 2:
@@ -686,16 +717,20 @@ def rank_vessels_by_dfsi(vessels_dict: Dict[str, Dict], top_n: int = 50) -> List
         'final_memory_mb': get_memory_usage_mb(),
     })
 
-going_dark_count = sum(1 for a in all_anomalies if a.get('anomaly_type') == 'going_dark')
-print(
-    f"[Worker {worker_id}] Finished — {total_records:,} records, "
-    f"{len(all_anomalies)} total anomalies ({going_dark_count} going-dark, "
-    f"{len(all_anomalies) - going_dark_count} teleportation)"
-)
+    going_dark_count = sum(1 for a in all_anomalies if a.get('anomaly_type') == 'going_dark')
+    teleportation_count = sum(1 for a in all_anomalies if a.get('anomaly_type') == 'teleportation')
+    draft_count = sum(1 for a in all_anomalies if a.get('anomaly_type') == 'draft_change')
+    
+    print(
+        f"[Worker {worker_id}] Finished — {total_records:,} records, "
+        f"{len(all_anomalies)} total anomalies "
+        f"(Going Dark: {going_dark_count}, Teleport: {teleportation_count}, Draft: {draft_count})"
+    )
 
 
+# ============================================================================
 # MAIN PARALLEL PROCESSING COORDINATOR
-# =============================================================================
+# ============================================================================
 
 class StreamingPartitioner:
     """
@@ -740,9 +775,9 @@ class StreamingPartitioner:
             for mmsi, records in chunk.items():
                 worker_chunks[hash(mmsi) % self.num_workers][mmsi].extend(records)
         else:
-            # flat list: (mmsi, ts_str, epoch, lat, lon)
-            for mmsi, ts_str, epoch, lat, lon in chunk:
-                worker_chunks[hash(mmsi) % self.num_workers][mmsi].append((ts_str, epoch, lat, lon))
+            # flat list: (mmsi, ts_str, epoch, lat, lon, sog, draught)
+            for mmsi, ts_str, epoch, lat, lon, sog, draught in chunk:
+                worker_chunks[hash(mmsi) % self.num_workers][mmsi].append((ts_str, epoch, lat, lon, sog, draught))
 
         for worker_id, sub_chunk in worker_chunks.items():
             self.worker_queues[worker_id].put(dict(sub_chunk))
@@ -829,39 +864,38 @@ class StreamingPartitioner:
 
         return aggregated_results
 
-
     def _calculate_dfsi_rankings(self, aggregated_results: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Post-process anomalies to calculate DFSI and rank vessels.
-    
-    Args:
-        aggregated_results: Results from _aggregate_results()
-    
-    Returns:
-        Enhanced results with DFSI rankings
-    """
-    all_anomalies = aggregated_results.get('anomalies', [])
-    
-    # Aggregate anomalies by vessel and calculate DFSI
-    vessels_dict = aggregate_anomalies_by_vessel(all_anomalies)
-    
-    # Get top 50 most suspicious vessels
-    top_vessels = rank_vessels_by_dfsi(vessels_dict, top_n=50)
-    
-    # Add to results
-    aggregated_results['vessels_by_dfsi'] = top_vessels
-    aggregated_results['total_flagged_vessels'] = len(vessels_dict)
-    
-    # Calculate summary statistics
-    all_dfsi_scores = [v['dfsi'] for v in top_vessels]
-    aggregated_results['dfsi_stats'] = {
-        'mean': round(sum(all_dfsi_scores) / len(all_dfsi_scores), 2) if all_dfsi_scores else 0,
-        'max': max(all_dfsi_scores) if all_dfsi_scores else 0,
-        'min': min(all_dfsi_scores) if all_dfsi_scores else 0,
-    }
-    
-    return aggregated_results
-    
+        """
+        Post-process anomalies to calculate DFSI and rank vessels.
+        
+        Args:
+            aggregated_results: Results from _aggregate_results()
+        
+        Returns:
+            Enhanced results with DFSI rankings
+        """
+        all_anomalies = aggregated_results.get('anomalies', [])
+        
+        # Aggregate anomalies by vessel and calculate DFSI
+        vessels_dict = aggregate_anomalies_by_vessel(all_anomalies)
+        
+        # Get top 50 most suspicious vessels
+        top_vessels = rank_vessels_by_dfsi(vessels_dict, top_n=50)
+        
+        # Add to results
+        aggregated_results['vessels_by_dfsi'] = top_vessels
+        aggregated_results['total_flagged_vessels'] = len(vessels_dict)
+        
+        # Calculate summary statistics
+        all_dfsi_scores = [v['dfsi'] for v in top_vessels]
+        aggregated_results['dfsi_stats'] = {
+            'mean': round(sum(all_dfsi_scores) / len(all_dfsi_scores), 2) if all_dfsi_scores else 0,
+            'max': max(all_dfsi_scores) if all_dfsi_scores else 0,
+            'min': min(all_dfsi_scores) if all_dfsi_scores else 0,
+        }
+        
+        return aggregated_results
+
     def _aggregate_results(self) -> Dict[str, Any]:
         """Collect and aggregate results from all workers."""
         worker_results = []
@@ -928,16 +962,24 @@ class StreamingPartitioner:
             for i, (mmsi, count) in enumerate(sorted_vessels, 1):
                 print(f"  {i:2}. MMSI {mmsi}: {count:,} records")
 
-        # Show going-dark anomalies
+        # Show anomalies by type
         anomalies = results.get('anomalies', [])
-
         going_dark_anomalies = [a for a in anomalies if a.get('anomaly_type') == 'going_dark']
-        teleportation = [a for a in anomalies if a.get('anomaly_type') == 'teleportation']
-        print(f"\nGoing-Dark Anomalies Detected: {len(going_dark_anomalies)}")
-        print(f"\nTeleportation Anomalies Detected: {len(teleportation)}")
+        teleportation_anomalies = [a for a in anomalies if a.get('anomaly_type') == 'teleportation']
+        draft_change_anomalies = [a for a in anomalies if a.get('anomaly_type') == 'draft_change']
+        
+        print(f"\n{'='*70}")
+        print("ANOMALIES SUMMARY")
+        print(f"{'='*70}")
+        print(f"Going-Dark Anomalies (A): {len(going_dark_anomalies)}")
+        print(f"Teleportation Anomalies (D): {len(teleportation_anomalies)}")
+        print(f"Draft Change Anomalies (C): {len(draft_change_anomalies)}")
+        print(f"Total Anomalies: {len(anomalies)}")
+
         if going_dark_anomalies:
             # Sort by longest gap first
-            top_anomalies = sorted(going_dark_anomalies, key=lambda a: a['gap_hours'], reverse=True)[:10]
+            top_anomalies = sorted(going_dark_anomalies, key=lambda a: a['gap_hours'], reverse=True)[:5]
+            print(f"\nTop 5 Going-Dark Events:")
             print("-" * 60)
             print(f"  {'MMSI':<12} {'Gap (h)':>8}  {'Distance (km)':>14}  Gap window")
             print("-" * 60)
@@ -946,26 +988,27 @@ class StreamingPartitioner:
                     f"  {a['mmsi']:<12} {a['gap_hours']:>8.1f}  "
                     f"{a['distance_km']:>14.1f}  "
                     f"{a['gap_start']} → {a['gap_end']}"
-                # Show DFSI Rankings
-                    
+                )
+
+        # Show DFSI Rankings
         if 'vessels_by_dfsi' in results:
             top_vessels = results['vessels_by_dfsi'][:10]
             print(f"\n{'='*70}")
             print("TOP 10 SHADOW FLEET SUSPECTS (by DFSI)")
             print(f"{'='*70}")
-            print(f"{'Rank':<6} {'MMSI':<12} {'DFSI':>8} {'Going Dark':>12} {'Teleport':>12} {'Draft Chg':>10}")
+            print(f"{'Rank':<6} {'MMSI':<12} {'DFSI':>8} {'Dark':>6} {'Teleport':>10} {'Draft':>6}")
             print("-" * 70)
             for i, vessel in enumerate(top_vessels, 1):
                 counts = vessel['anomaly_counts']
                 print(
                     f"{i:<6} {vessel['mmsi']:<12} {vessel['dfsi']:>8.2f} "
-                    f"{counts.get('going_dark', 0):>12} "
-                    f"{counts.get('teleportation', 0):>12} "
-                    f"{counts.get('draft_change', 0):>10}"
+                    f"{counts.get('going_dark', 0):>6} "
+                    f"{counts.get('teleportation', 0):>10} "
+                    f"{counts.get('draft_change', 0):>6}"
                 )
             
-            print(f"\nDFSI Statistics:")
-            print(f"  Mean DFSI (top 50): {results['dfsi_stats']['mean']:.2f}")
+            print(f"\nDFSI Statistics (Top 50):")
+            print(f"  Mean DFSI: {results['dfsi_stats']['mean']:.2f}")
             print(f"  Max DFSI: {results['dfsi_stats']['max']:.2f}")
+            print(f"  Min DFSI: {results['dfsi_stats']['min']:.2f}")
             print(f"  Total flagged vessels: {results.get('total_flagged_vessels', 0)}")
-                )
