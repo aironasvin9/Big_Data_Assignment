@@ -597,10 +597,15 @@ class StreamingPartitioner:
 
         # Show going-dark anomalies
         anomalies = results.get('anomalies', [])
-        print(f"\nGoing-Dark Anomalies Detected: {len(anomalies)}")
-        if anomalies:
+
+        going_dark_anomalies = [a for a in anomalies if a.get('anomaly_type') == 'going_dark']
+        teleportation = [a for a in anomalies if a.get('anomaly_type') == 'teleportation']
+        print(f"\nGoing-Dark Anomalies Detected: {len(going_dark_anomalies)}")
+        print(f"\nTeleportation Anomalies Detected: {len(teleportation)}")
+        if going_dark_anomalies:
             # Sort by longest gap first
-            top_anomalies = sorted(anomalies, key=lambda a: a['gap_hours'], reverse=True)[:10]
+            top_anomalies = sorted(going_dark_anomalies, key=lambda a: a['gap_hours'], reverse=True)[:10]
+            print(f"\nTeleportation Anomalies Detected: {len(teleportation)}")
             print("-" * 60)
             print(f"  {'MMSI':<12} {'Gap (h)':>8}  {'Distance (km)':>14}  Gap window")
             print("-" * 60)
