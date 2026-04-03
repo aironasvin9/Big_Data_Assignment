@@ -918,44 +918,49 @@ class StreamingPartitioner:
         
         return aggregated_results
 
-    def _aggregate_results(self) -> Dict[str, Any]:
-        """Collect and aggregate results from all workers."""
-        worker_results = []
-        total_records = 0
-        combined_mmsi_counts: Dict[str, int] = defaultdict(int)
-        all_anomalies: List[Dict[str, Any]] = []
+def _aggregate_results(self) -> Dict[str, Any]:
+    """Collect and aggregate results from all workers."""
+    worker_results = []
+    total_records = 0
+    combined_mmsi_counts: Dict[str, int] = defaultdict(int)
+    all_anomalies: List[Dict[str, Any]] = []
+    all_mmsi_records: Dict[str, List[Tuple]] = defaultdict(list)  # ⭐ ADD THIS
 
-        results_received = 0
-        while results_received < self.num_workers:
-            try:
-                result = self.result_queue.get(timeout=60.0)
-                worker_results.append(result)
-                total_records += result['total_records']
+    results_received = 0
+    while results_received < self.num_workers:
+        try:
+            result = self.result_queue.get(timeout=60.0)
+            worker_results.append(result)
+            total_records += result['total_records']
 
-                for mmsi, count in result['mmsi_counts'].items():
-                    combined_mmsi_counts[mmsi] += count
+            for mmsi, count in result['mmsi_counts'].items():
+                combined_mmsi_counts[mmsi] += count
 
-                all_anomalies.extend(result.get('anomalies', []))
+            all_anomalies.extend(result.get('anomalies', []))
+            
+            for mmsi, records in result.get('mmsi_records', {}).items():
+                all_mmsi_records[mmsi].extend(records)
 
-                results_received += 1
-                print(
-                    f"[Main] Worker {result['worker_id']} — "
-                    f"{result['total_records']:,} records, "
-                    f"{len(result.get('anomalies', []))} anomalies"
-                )
+            results_received += 1
+            print(
+                f"[Main] Worker {result['worker_id']} — "
+                f"{result['total_records']:,} records, "
+                f"{len(result.get('anomalies', []))} anomalies"
+            )
 
-            except Exception as e:
-                print(f"[Main] Timeout waiting for worker results: {e}")
-                break
+        except Exception as e:
+            print(f"[Main] Timeout waiting for worker results: {e}")
+            break
 
-        return {
-            'worker_results': worker_results,
-            'total_records': total_records,
-            'unique_vessels': len(combined_mmsi_counts),
-            'mmsi_counts': dict(combined_mmsi_counts),
-            'anomalies': all_anomalies,
-            'max_memory_mb': max(r['final_memory_mb'] for r in worker_results) if worker_results else 0,
-        }
+    return {
+        'worker_results': worker_results,
+        'total_records': total_records,
+        'unique_vessels': len(combined_mmsi_counts),
+        'mmsi_counts': dict(combined_mmsi_counts),
+        'anomalies': all_anomalies,
+        'mmsi_records': dict(all_mmsi_records),  # ⭐ ADD THIS
+        'max_memory_mb': max(r['final_memory_mb'] for r in worker_results) if worker_results else 0,
+    }
 
     def _print_summary(self, results: Dict[str, Any]) -> None:
         """Print a summary of processing results."""
