@@ -372,12 +372,12 @@ def calculate_dfsi(mmsi: str, anomalies_for_vessel: List[Dict[str, Any]]) -> flo
     - MAX_GAP_HOURS: Longest "going dark" gap in hours
     - TOTAL_IMPOSSIBLE_DISTANCE_NM: Sum of all teleportation distances in nautical miles
     - C: Count of draft change anomalies
-    - B: Count of loitering anomalies (NEW)
+    - B: Count of loitering anomalies
     """
     going_dark_anomalies = [a for a in anomalies_for_vessel if a.get('anomaly_type') == 'going_dark']
     teleportation_anomalies = [a for a in anomalies_for_vessel if a.get('anomaly_type') == 'teleportation']
     draft_change_anomalies = [a for a in anomalies_for_vessel if a.get('anomaly_type') == 'draft_change']
-    loitering_anomalies = [a for a in anomalies_for_vessel if a.get('anomaly_type') == 'loitering']  # NEW
+    loitering_anomalies = [a for a in anomalies_for_vessel if a.get('anomaly_type') == 'loitering']
     
     max_gap_hours = 0.0
     if going_dark_anomalies:
@@ -390,7 +390,7 @@ def calculate_dfsi(mmsi: str, anomalies_for_vessel: List[Dict[str, Any]]) -> flo
         )
     
     draft_change_count = len(draft_change_anomalies)
-    loitering_count = len(loitering_anomalies)  # NEW
+    loitering_count = len(loitering_anomalies)
     
     dfsi = (max_gap_hours / 2.0) + (total_impossible_distance_nm / 10.0) + (draft_change_count * 15.0) + (loitering_count * 10.0)
     
@@ -419,7 +419,7 @@ def aggregate_anomalies_by_vessel(all_anomalies: List[Dict[str, Any]]) -> Dict[s
     
     # Group anomalies by MMSI
     for anomaly in all_anomalies:
-        mmsi = anomaly.get('mmsi')
+        mmsi = anomaly.get('mmsi') or anomaly.get('mmsi_vessel1')
         if not mmsi:
             continue
         
@@ -724,7 +724,7 @@ def worker_process(
         'total_records': total_records,
         'mmsi_counts': {mmsi: len(recs) for mmsi, recs in mmsi_data.items()},
         'anomalies': all_anomalies,
-        'mmsi_records': dict(mmsi_data),  # ⭐ ADD THIS LINE
+        'mmsi_records': dict(mmsi_data),
         'final_memory_mb': get_memory_usage_mb(),
     })
 
@@ -875,85 +875,86 @@ class StreamingPartitioner:
 
         return aggregated_results
 
-def _calculate_dfsi_rankings(self, aggregated_results: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Post-process anomalies to calculate DFSI and rank vessels.
-    """
-    all_anomalies = aggregated_results.get('anomalies', [])
-    all_mmsi_records = aggregated_results.get('mmsi_records', {})
-    
-    # ⭐ DETECT ANOMALY B (Loitering) - POST-PROCESSING
-    print("\n[Main] Detecting Anomaly B (Loitering & Transfers)...")
-    if all_mmsi_records:
-        loitering_anomalies = detect_loitering_anomalies(all_mmsi_records)
-        all_anomalies.extend(loitering_anomalies)
-        print(f"[Main] Found {len(loitering_anomalies)} loitering anomalies")
-    else:
-        print("[Main] WARNING: No mmsi_records available for Anomaly B detection")
-    
-    # Aggregate anomalies by vessel and calculate DFSI
-    vessels_dict = aggregate_anomalies_by_vessel(all_anomalies)
-    
-    # Get top 50 most suspicious vessels
-    top_vessels = rank_vessels_by_dfsi(vessels_dict, top_n=50)
-    
-    # Add to results
-    aggregated_results['vessels_by_dfsi'] = top_vessels
-    aggregated_results['total_flagged_vessels'] = len(vessels_dict)
-    
-    # Calculate summary statistics
-    all_dfsi_scores = [v['dfsi'] for v in top_vessels]
-    aggregated_results['dfsi_stats'] = {
-        'mean': round(sum(all_dfsi_scores) / len(all_dfsi_scores), 2) if all_dfsi_scores else 0,
-        'max': max(all_dfsi_scores) if all_dfsi_scores else 0,
-        'min': min(all_dfsi_scores) if all_dfsi_scores else 0,
-    }
-    
-    return aggregated_results
+    def _aggregate_results(self) -> Dict[str, Any]:
+        """Collect and aggregate results from all workers."""
+        worker_results = []
+        total_records = 0
+        combined_mmsi_counts: Dict[str, int] = defaultdict(int)
+        all_anomalies: List[Dict[str, Any]] = []
+        all_mmsi_records: Dict[str, List[Tuple]] = defaultdict(list)
 
-def _aggregate_results(self) -> Dict[str, Any]:
-    """Collect and aggregate results from all workers."""
-    worker_results = []
-    total_records = 0
-    combined_mmsi_counts: Dict[str, int] = defaultdict(int)
-    all_anomalies: List[Dict[str, Any]] = []
-    all_mmsi_records: Dict[str, List[Tuple]] = defaultdict(list)  # ⭐ ADD THIS
+        results_received = 0
+        while results_received < self.num_workers:
+            try:
+                result = self.result_queue.get(timeout=60.0)
+                worker_results.append(result)
+                total_records += result['total_records']
 
-    results_received = 0
-    while results_received < self.num_workers:
-        try:
-            result = self.result_queue.get(timeout=60.0)
-            worker_results.append(result)
-            total_records += result['total_records']
+                for mmsi, count in result['mmsi_counts'].items():
+                    combined_mmsi_counts[mmsi] += count
 
-            for mmsi, count in result['mmsi_counts'].items():
-                combined_mmsi_counts[mmsi] += count
+                all_anomalies.extend(result.get('anomalies', []))
+                
+                for mmsi, records in result.get('mmsi_records', {}).items():
+                    all_mmsi_records[mmsi].extend(records)
 
-            all_anomalies.extend(result.get('anomalies', []))
-            
-            for mmsi, records in result.get('mmsi_records', {}).items():
-                all_mmsi_records[mmsi].extend(records)
+                results_received += 1
+                print(
+                    f"[Main] Worker {result['worker_id']} — "
+                    f"{result['total_records']:,} records, "
+                    f"{len(result.get('anomalies', []))} anomalies"
+                )
 
-            results_received += 1
-            print(
-                f"[Main] Worker {result['worker_id']} — "
-                f"{result['total_records']:,} records, "
-                f"{len(result.get('anomalies', []))} anomalies"
-            )
+            except Exception as e:
+                print(f"[Main] Timeout waiting for worker results: {e}")
+                break
 
-        except Exception as e:
-            print(f"[Main] Timeout waiting for worker results: {e}")
-            break
+        return {
+            'worker_results': worker_results,
+            'total_records': total_records,
+            'unique_vessels': len(combined_mmsi_counts),
+            'mmsi_counts': dict(combined_mmsi_counts),
+            'anomalies': all_anomalies,
+            'mmsi_records': dict(all_mmsi_records),
+            'max_memory_mb': max(r['final_memory_mb'] for r in worker_results) if worker_results else 0,
+        }
 
-    return {
-        'worker_results': worker_results,
-        'total_records': total_records,
-        'unique_vessels': len(combined_mmsi_counts),
-        'mmsi_counts': dict(combined_mmsi_counts),
-        'anomalies': all_anomalies,
-        'mmsi_records': dict(all_mmsi_records),  # ⭐ ADD THIS
-        'max_memory_mb': max(r['final_memory_mb'] for r in worker_results) if worker_results else 0,
-    }
+    def _calculate_dfsi_rankings(self, aggregated_results: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Post-process anomalies to calculate DFSI and rank vessels.
+        """
+        all_anomalies = aggregated_results.get('anomalies', [])
+        all_mmsi_records = aggregated_results.get('mmsi_records', {})
+        
+        # DETECT ANOMALY B (Loitering) - POST-PROCESSING
+        print("\n[Main] Detecting Anomaly B (Loitering & Transfers)...")
+        if all_mmsi_records:
+            loitering_anomalies = detect_loitering_anomalies(all_mmsi_records)
+            all_anomalies.extend(loitering_anomalies)
+            print(f"[Main] Found {len(loitering_anomalies)} loitering anomalies")
+        else:
+            print("[Main] WARNING: No mmsi_records available for Anomaly B detection")
+        
+        # Aggregate anomalies by vessel and calculate DFSI
+        vessels_dict = aggregate_anomalies_by_vessel(all_anomalies)
+        
+        # Get top 50 most suspicious vessels
+        top_vessels = rank_vessels_by_dfsi(vessels_dict, top_n=50)
+        
+        # Add to results
+        aggregated_results['vessels_by_dfsi'] = top_vessels
+        aggregated_results['total_flagged_vessels'] = len(vessels_dict)
+        aggregated_results['anomalies'] = all_anomalies
+        
+        # Calculate summary statistics
+        all_dfsi_scores = [v['dfsi'] for v in top_vessels]
+        aggregated_results['dfsi_stats'] = {
+            'mean': round(sum(all_dfsi_scores) / len(all_dfsi_scores), 2) if all_dfsi_scores else 0,
+            'max': max(all_dfsi_scores) if all_dfsi_scores else 0,
+            'min': min(all_dfsi_scores) if all_dfsi_scores else 0,
+        }
+        
+        return aggregated_results
 
     def _print_summary(self, results: Dict[str, Any]) -> None:
         """Print a summary of processing results."""
@@ -987,6 +988,7 @@ def _aggregate_results(self) -> Dict[str, Any]:
         going_dark_anomalies = [a for a in anomalies if a.get('anomaly_type') == 'going_dark']
         teleportation_anomalies = [a for a in anomalies if a.get('anomaly_type') == 'teleportation']
         draft_change_anomalies = [a for a in anomalies if a.get('anomaly_type') == 'draft_change']
+        loitering_anomalies = [a for a in anomalies if a.get('anomaly_type') == 'loitering']
         
         print(f"\n{'='*70}")
         print("ANOMALIES SUMMARY")
@@ -994,6 +996,7 @@ def _aggregate_results(self) -> Dict[str, Any]:
         print(f"Going-Dark Anomalies (A): {len(going_dark_anomalies)}")
         print(f"Teleportation Anomalies (D): {len(teleportation_anomalies)}")
         print(f"Draft Change Anomalies (C): {len(draft_change_anomalies)}")
+        print(f"Loitering Anomalies (B): {len(loitering_anomalies)}")
         print(f"Total Anomalies: {len(anomalies)}")
 
         if going_dark_anomalies:
@@ -1016,15 +1019,16 @@ def _aggregate_results(self) -> Dict[str, Any]:
             print(f"\n{'='*70}")
             print("TOP 10 SHADOW FLEET SUSPECTS (by DFSI)")
             print(f"{'='*70}")
-            print(f"{'Rank':<6} {'MMSI':<12} {'DFSI':>8} {'Dark':>6} {'Teleport':>10} {'Draft':>6}")
-            print("-" * 70)
+            print(f"{'Rank':<6} {'MMSI':<12} {'DFSI':>8} {'Dark':>6} {'Teleport':>10} {'Draft':>6} {'Loiter':>6}")
+            print("-" * 80)
             for i, vessel in enumerate(top_vessels, 1):
                 counts = vessel['anomaly_counts']
                 print(
                     f"{i:<6} {vessel['mmsi']:<12} {vessel['dfsi']:>8.2f} "
                     f"{counts.get('going_dark', 0):>6} "
                     f"{counts.get('teleportation', 0):>10} "
-                    f"{counts.get('draft_change', 0):>6}"
+                    f"{counts.get('draft_change', 0):>6} "
+                    f"{counts.get('loitering', 0):>6}"
                 )
             
             print(f"\nDFSI Statistics (Top 50):")
