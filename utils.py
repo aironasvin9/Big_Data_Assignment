@@ -245,13 +245,12 @@ def detect_loitering_anomalies(
     loitering_duration_hours: float = 2.0,
 ) -> List[Dict[str, Any]]:
     """
-    Anomaly B: Detect two distinct vessels within 500m of each other with SOG <1 knot for >2 hours.
-    
-    This is a post-processing step that compares all vessel pairs globally.
+    Anomaly B: Detect two distinct vessels within 500m of each other with 
+    SOG <1 knot for >2 hours (possible ship-to-ship transfer).
     
     Args:
         mmsi_records: Dict mapping mmsi -> [(ts_str, epoch, lat, lon, sog, draught), ...]
-        proximity_threshold_km: Distance threshold (default 500m = 0.5km)
+        proximity_threshold_km: Distance threshold (default 0.5 km = 500m)
         sog_threshold_knots: Speed threshold (default 1 knot)
         loitering_duration_hours: Minimum loitering duration (default 2 hours)
     
@@ -259,10 +258,10 @@ def detect_loitering_anomalies(
         List of loitering anomalies
     """
     anomalies = []
-    loitering_sec = loitering_duration_hours * 3600
+    loitering_sec = loitering_duration_hours * 3600  # 7200 seconds for 2 hours
     mmsi_list = sorted(mmsi_records.keys())
     
-    # Check all pairs of vessels
+    # Check all pairs of distinct vessels
     for idx1 in range(len(mmsi_list)):
         for idx2 in range(idx1 + 1, len(mmsi_list)):
             mmsi1 = mmsi_list[idx1]
@@ -271,54 +270,89 @@ def detect_loitering_anomalies(
             records1 = mmsi_records[mmsi1]
             records2 = mmsi_records[mmsi2]
             
+            # Need at least 2 records per vessel (to detect movement/stationarity)
             if len(records1) < 2 or len(records2) < 2:
                 continue
             
-            # Find overlapping time windows
-            min_time = max(records1[0][1], records2[0][1])
-            max_time = min(records1[-1][1], records2[-1][1])
+            # Records should already be sorted by epoch (worker does this)
+            # Find overlapping time window
+            min_epoch = max(records1[0][1], records2[0][1])
+            max_epoch = min(records1[-1][1], records2[-1][1])
             
-            if max_time - min_time < loitering_sec:
+            # Must have at least 2 hours of overlap
+            overlap_duration = max_epoch - min_epoch
+            if overlap_duration < loitering_sec:
                 continue
             
-            # Check for sustained proximity and low speed
-            close_count = 0
-            close_times = []
+            # Now find periods where both vessels are close AND slow
+            # Build a timeline of proximity events
+            proximity_windows = []
             
-            for rec1 in records1:
+            for i1, rec1 in enumerate(records1):
                 ts1, epoch1, lat1, lon1, sog1, _ = rec1
                 
-                # Skip if vessel 1 is moving too fast
+                # Vessel 1 must be moving slowly
                 if sog1 > sog_threshold_knots:
                     continue
                 
-                # Find closest record from vessel 2 within ±30 minutes
-                for rec2 in records2:
+                # Find records from vessel 2 that are close in time
+                for i2, rec2 in enumerate(records2):
                     ts2, epoch2, lat2, lon2, sog2, _ = rec2
                     
-                    # Time window check: within 30 minutes
-                    if abs(epoch1 - epoch2) > 1800:
+                    # Time window: within ±15 minutes for matching pings
+                    time_diff = abs(epoch1 - epoch2)
+                    if time_diff > 900:  # 900 seconds = 15 minutes
                         continue
                     
-                    # Speed check: both must be slow
+                    # Vessel 2 must also be moving slowly
                     if sog2 > sog_threshold_knots:
                         continue
                     
-                    # Distance check
-                    dist = haversine_distance(lat1, lon1, lat2, lon2)
-                    if dist < proximity_threshold_km:
-                        close_count += 1
-                        close_times.append(epoch1)
-                        break
+                    # Calculate distance
+                    dist_km = haversine_distance(lat1, lon1, lat2, lon2)
+                    
+                    # Must be close (within 500m)
+                    if dist_km < proximity_threshold_km:
+                        proximity_windows.append({
+                            'epoch': epoch1,  # Use vessel 1's timestamp
+                            'ts1': ts1,
+                            'ts2': ts2,
+                            'mmsi1': mmsi1,
+                            'mmsi2': mmsi2,
+                            'dist_km': dist_km,
+                            'pos1': (lat1, lon1),
+                            'pos2': (lat2, lon2),
+                            'sog1': sog1,
+                            'sog2': sog2,
+                        })
             
-            # Flag if sustained proximity detected
-            if close_count >= 3:  # At least 3 instances of close proximity
+            # Check if proximity windows span at least 2 hours
+            if len(proximity_windows) < 3:
+                continue
+            
+            proximity_windows.sort(key=lambda x: x['epoch'])
+            
+            # Find continuous loitering period
+            # Check if from first to last proximity event >= 2 hours
+            duration = proximity_windows[-1]['epoch'] - proximity_windows[0]['epoch']
+            
+            if duration >= loitering_sec:
+                # Extract key moments
+                first_event = proximity_windows[0]
+                last_event = proximity_windows[-1]
+                
                 anomalies.append({
                     'mmsi_vessel1': mmsi1,
                     'mmsi_vessel2': mmsi2,
-                    'proximity_events': close_count,
-                    'proximity_threshold_km': proximity_threshold_km,
                     'anomaly_type': 'loitering',
+                    'loitering_start': first_event['ts1'],
+                    'loitering_end': last_event['ts1'],
+                    'duration_hours': round(duration / 3600.0, 2),
+                    'proximity_events': len(proximity_windows),
+                    'min_distance_km': round(min(p['dist_km'] for p in proximity_windows), 3),
+                    'location': first_event['pos1'],  # Location of first event
+                    'vessel1_avg_sog': round(sum(p['sog1'] for p in proximity_windows) / len(proximity_windows), 2),
+                    'vessel2_avg_sog': round(sum(p['sog2'] for p in proximity_windows) / len(proximity_windows), 2),
                 })
     
     return anomalies
