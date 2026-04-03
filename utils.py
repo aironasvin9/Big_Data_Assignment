@@ -886,37 +886,41 @@ class StreamingPartitioner:
 
         return aggregated_results
 
-    def _calculate_dfsi_rankings(self, aggregated_results: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Post-process anomalies to calculate DFSI and rank vessels.
-        
-        Args:
-            aggregated_results: Results from _aggregate_results()
-        
-        Returns:
-            Enhanced results with DFSI rankings
-        """
-        all_anomalies = aggregated_results.get('anomalies', [])
-        
-        # Aggregate anomalies by vessel and calculate DFSI
-        vessels_dict = aggregate_anomalies_by_vessel(all_anomalies)
-        
-        # Get top 50 most suspicious vessels
-        top_vessels = rank_vessels_by_dfsi(vessels_dict, top_n=50)
-        
-        # Add to results
-        aggregated_results['vessels_by_dfsi'] = top_vessels
-        aggregated_results['total_flagged_vessels'] = len(vessels_dict)
-        
-        # Calculate summary statistics
-        all_dfsi_scores = [v['dfsi'] for v in top_vessels]
-        aggregated_results['dfsi_stats'] = {
-            'mean': round(sum(all_dfsi_scores) / len(all_dfsi_scores), 2) if all_dfsi_scores else 0,
-            'max': max(all_dfsi_scores) if all_dfsi_scores else 0,
-            'min': min(all_dfsi_scores) if all_dfsi_scores else 0,
-        }
-        
-        return aggregated_results
+def _calculate_dfsi_rankings(self, aggregated_results: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Post-process anomalies to calculate DFSI and rank vessels.
+    """
+    all_anomalies = aggregated_results.get('anomalies', [])
+    all_mmsi_records = aggregated_results.get('mmsi_records', {})
+    
+    # ⭐ DETECT ANOMALY B (Loitering) - POST-PROCESSING
+    print("\n[Main] Detecting Anomaly B (Loitering & Transfers)...")
+    if all_mmsi_records:
+        loitering_anomalies = detect_loitering_anomalies(all_mmsi_records)
+        all_anomalies.extend(loitering_anomalies)
+        print(f"[Main] Found {len(loitering_anomalies)} loitering anomalies")
+    else:
+        print("[Main] WARNING: No mmsi_records available for Anomaly B detection")
+    
+    # Aggregate anomalies by vessel and calculate DFSI
+    vessels_dict = aggregate_anomalies_by_vessel(all_anomalies)
+    
+    # Get top 50 most suspicious vessels
+    top_vessels = rank_vessels_by_dfsi(vessels_dict, top_n=50)
+    
+    # Add to results
+    aggregated_results['vessels_by_dfsi'] = top_vessels
+    aggregated_results['total_flagged_vessels'] = len(vessels_dict)
+    
+    # Calculate summary statistics
+    all_dfsi_scores = [v['dfsi'] for v in top_vessels]
+    aggregated_results['dfsi_stats'] = {
+        'mean': round(sum(all_dfsi_scores) / len(all_dfsi_scores), 2) if all_dfsi_scores else 0,
+        'max': max(all_dfsi_scores) if all_dfsi_scores else 0,
+        'min': min(all_dfsi_scores) if all_dfsi_scores else 0,
+    }
+    
+    return aggregated_results
 
 def _aggregate_results(self) -> Dict[str, Any]:
     """Collect and aggregate results from all workers."""
