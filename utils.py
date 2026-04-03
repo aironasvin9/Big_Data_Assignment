@@ -366,44 +366,33 @@ def calculate_dfsi(mmsi: str, anomalies_for_vessel: List[Dict[str, Any]]) -> flo
     """
     Calculate Dynamic Fictional Suspicion Index (DFSI) for a vessel.
     
-    Formula:
-    DFSI = (MAX_GAP_HOURS / 2) + (TOTAL_IMPOSSIBLE_DISTANCE_JUMPS / 10) + (C * 15)
+    DFSI = (MAX_GAP_HOURS / 2) + (TOTAL_IMPOSSIBLE_DISTANCE_NM / 10) + (C * 15) + (B * 10)
     
     Where:
     - MAX_GAP_HOURS: Longest "going dark" gap in hours
-    - TOTAL_IMPOSSIBLE_DISTANCE_JUMPS: Sum of all teleportation distances in nautical miles
+    - TOTAL_IMPOSSIBLE_DISTANCE_NM: Sum of all teleportation distances in nautical miles
     - C: Count of draft change anomalies
-    
-    Args:
-        mmsi: Vessel MMSI
-        anomalies_for_vessel: List of all anomalies for this vessel
-    
-    Returns:
-        DFSI score (float)
+    - B: Count of loitering anomalies (NEW)
     """
-    # Extract anomaly-specific data
     going_dark_anomalies = [a for a in anomalies_for_vessel if a.get('anomaly_type') == 'going_dark']
     teleportation_anomalies = [a for a in anomalies_for_vessel if a.get('anomaly_type') == 'teleportation']
     draft_change_anomalies = [a for a in anomalies_for_vessel if a.get('anomaly_type') == 'draft_change']
+    loitering_anomalies = [a for a in anomalies_for_vessel if a.get('anomaly_type') == 'loitering']  # NEW
     
-    # Component 1: Max gap in hours
     max_gap_hours = 0.0
     if going_dark_anomalies:
         max_gap_hours = max(a['gap_hours'] for a in going_dark_anomalies)
     
-    # Component 2: Total impossible distance in nautical miles
     total_impossible_distance_nm = 0.0
     if teleportation_anomalies:
-        # Use pre-calculated distance_nm if available, otherwise convert
         total_impossible_distance_nm = sum(
             a.get('distance_nm', a['distance_km'] / 1.852) for a in teleportation_anomalies
         )
     
-    # Component 3: Count of draft changes
     draft_change_count = len(draft_change_anomalies)
+    loitering_count = len(loitering_anomalies)  # NEW
     
-    # Calculate DFSI
-    dfsi = (max_gap_hours / 2.0) + (total_impossible_distance_nm / 10.0) + (draft_change_count * 15.0)
+    dfsi = (max_gap_hours / 2.0) + (total_impossible_distance_nm / 10.0) + (draft_change_count * 15.0) + (loitering_count * 10.0)
     
     return round(dfsi, 2)
 
