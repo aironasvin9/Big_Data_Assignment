@@ -688,32 +688,25 @@ def worker_process(
 ) -> None:
     """
     Worker process that accumulates records and detects anomalies.
-    
-    Phase 1: Accumulate all records for each MMSI
-    Phase 2: Sort by timestamp and detect all anomalies
     """
     processed_chunks = 0
     total_records = 0
-    # Dict[mmsi -> list of (ts_str, epoch_sec, lat, lon, sog, draught)]
     mmsi_data: Dict[str, List[Tuple]] = defaultdict(list)
 
     print(f"[Worker {worker_id}] Started")
 
-    # ----- Phase 1: accumulate ------------------------------------------------
+    # Phase 1: accumulate
     while not stop_flag.value:
         try:
             chunk = task_queue.get(timeout=0.2)
-
-            if chunk is None:  # Poison pill
+            if chunk is None:
                 break
 
-            # chunk is a dict {mmsi: [(ts_str, epoch, lat, lon, sog, draught), ...]}
             for mmsi, records in chunk.items():
                 mmsi_data[mmsi].extend(records)
                 total_records += len(records)
 
             processed_chunks += 1
-
             if processed_chunks % 100 == 0:
                 print(
                     f"[Worker {worker_id}] {processed_chunks} chunks, "
@@ -725,21 +718,15 @@ def worker_process(
                 print(f"[Worker {worker_id}] Error: {e}")
             continue
 
-    # ----- Phase 2: sort + detect anomalies -----------------------------------
+    # Phase 2: sort + detect anomalies
     all_anomalies: List[Dict[str, Any]] = []
     for mmsi, records in mmsi_data.items():
         if len(records) < 2:
             continue
-        # Sort by pre-parsed integer epoch — no datetime parsing needed here
         records.sort(key=lambda r: r[1])
         
-        # Anomaly A: Going Dark
         all_anomalies.extend(detect_going_dark_anomalies(mmsi, records))
-
-        # Anomaly D: Teleportation
         all_anomalies.extend(detect_teleportation_anomalies(mmsi, records))
-        
-        # Anomaly C: Draft Changes
         all_anomalies.extend(detect_draft_change_anomalies(mmsi, records))
 
     result_queue.put({
@@ -748,6 +735,7 @@ def worker_process(
         'total_records': total_records,
         'mmsi_counts': {mmsi: len(recs) for mmsi, recs in mmsi_data.items()},
         'anomalies': all_anomalies,
+        'mmsi_records': dict(mmsi_data),  # ⭐ ADD THIS LINE
         'final_memory_mb': get_memory_usage_mb(),
     })
 
