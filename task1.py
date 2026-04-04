@@ -6,6 +6,7 @@ Pass 2: Loitering detection (B) - STREAMING VERSION
 """
 import csv
 from analysis import write_anomalies_csv, write_vessel_scores_csv, write_metadata_json
+import psutil
 import os
 import time
 import gc
@@ -37,14 +38,10 @@ from parsing import stream_csv_rows, is_valid_mmsi, stream_valid_rows
 from geo import is_valid_coordinate
 
 
-def get_memory_usage_mb() -> float:
+def get_memory_usage_mb():
     """Get current memory usage in MB."""
-    try:
-        usage = resource.getrusage(resource.RUSAGE_SELF)
-        return usage.ru_maxrss / (1024 * 1024)
-    except Exception:
-        return 0.0
-
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / (1024 * 1024)
 
 def worker_process(
     worker_id: int,
