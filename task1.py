@@ -4,7 +4,8 @@ Command-line interface for Two-Pass Shadow Fleet Detection.
 Pass 1: Parallel detection (A, C, D)
 Pass 2: Loitering detection (B)
 """
-
+import csv
+from analysis import write_anomalies_csv, write_vessel_scores_csv, write_metadata_json
 import os
 import time
 import gc
@@ -331,30 +332,77 @@ class AISPipeline:
         }
 
     def _save_results(self, results: Dict[str, Any]) -> None:
-        """Save results to JSON files."""
-        with open(os.path.join(ANALYSIS_DIR, 'vessel_scores.json'), 'w') as f:
-            json.dump([v for v in results.get('vessels_by_dfsi', [])], f, indent=2)
+        """Save results to CSV and JSON files."""
+        print(f"\n{'='*70}")
+        print("WRITING OUTPUT FILES")
+        print(f"{'='*70}\n")
         
-        with open(os.path.join(ANALYSIS_DIR, 'top5_vessels.json'), 'w') as f:
-            json.dump(results.get('vessels_by_dfsi', [])[:5], f, indent=2)
+        all_anomalies = results.get('anomalies', [])
         
+        # Write anomalies by type
+        print("[Analysis] Writing anomaly events...")
+        write_anomalies_csv(all_anomalies, os.path.join(ANALYSIS_DIR, 'anomaly_events.csv'))
+        
+        # Write combined anomalies CSV
+        with open(os.path.join(ANALYSIS_DIR, 'all_anomalies.csv'), 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['mmsi', 'anomaly_type', 'timestamp'])
+            writer.writeheader()
+            for a in all_anomalies:
+                writer.writerow({
+                    'mmsi': a.get('mmsi', a.get('mmsi_vessel1', '')),
+                    'anomaly_type': a.get('anomaly_type'),
+                    'timestamp': a.get('gap_start', a.get('loitering_start', '')),
+                })
+        print(f"  ✓ Wrote {len(all_anomalies)} combined anomalies to all_anomalies.csv")
+        
+        # Write vessel scores
+        print("\n[Scoring] Writing vessel scores...")
+        top_vessels = results.get('vessels_by_dfsi', [])
+        write_vessel_scores_csv(top_vessels, os.path.join(ANALYSIS_DIR, 'vessel_scores.csv'))
+        
+        # Write top 5 as JSON
+        with open(os.path.join(ANALYSIS_DIR, 'top5_suspects.json'), 'w') as f:
+            json.dump(top_vessels[:5], f, indent=2, default=str)
+        print(f"  ✓ Wrote top 5 suspects to top5_suspects.json")
+        
+        # Write metadata
+        print("\n[Pipeline] Writing metadata...")
         metadata = {
-            'file': results['file'],
-            'file_size_gb': results['file_size_gb'],
+            'file': os.path.basename(results['file']),
+            'file_size_gb': round(results['file_size_gb'], 2),
             'total_records': results['total_records'],
             'unique_vessels': results['unique_vessels'],
-            'total_anomalies': len(results['anomalies']),
-            'elapsed_seconds': results['elapsed_seconds'],
-            'pass1_seconds': results['pass1_seconds'],
-            'pass2_seconds': results['pass2_seconds'],
-            'throughput_mb_per_sec': results['throughput_mb_per_sec'],
-            'max_memory_mb': results['max_memory_mb'],
+            'anomalies': {
+                'total': len(all_anomalies),
+                'going_dark': len([a for a in all_anomalies if a.get('anomaly_type') == 'going_dark']),
+                'teleportation': len([a for a in all_anomalies if a.get('anomaly_type') == 'teleportation']),
+                'draft_change': len([a for a in all_anomalies if a.get('anomaly_type') == 'draft_change']),
+                'loitering': len([a for a in all_anomalies if a.get('anomaly_type') == 'loitering']),
+            },
+            'timing': {
+                'pass1_sec': round(results['pass1_seconds'], 2),
+                'pass2_sec': round(results['pass2_seconds'], 2),
+                'total_sec': round(results['elapsed_seconds'], 2),
+                'throughput_mb_sec': round(results['throughput_mb_per_sec'], 2),
+            },
+            'resources': {
+                'peak_memory_mb': round(results['max_memory_mb'], 1),
+                'workers': len(results['worker_results']) if 'worker_results' in results else 0,
+            },
+            'dfsi': {
+                'mean': results['dfsi_stats']['mean'],
+                'max': results['dfsi_stats']['max'],
+                'min': results['dfsi_stats']['min'],
+                'flagged_vessels': results.get('total_flagged_vessels', 0),
+            },
         }
+        write_metadata_json(metadata, os.path.join(ANALYSIS_DIR, 'run_metadata.json'))
         
-        with open(os.path.join(ANALYSIS_DIR, 'run_metadata.json'), 'w') as f:
-            json.dump(metadata, f, indent=2)
-        
-        print(f"\n[Main] Results saved to {ANALYSIS_DIR}/")
+        print(f"\n{'='*70}")
+        print(f"✅ ALL OUTPUTS WRITTEN:")
+        print(f"  - {ANALYSIS_DIR}/")
+        print(f"  - {OUTPUT_DIRS[2]}/")
+        print(f"{'='*70}\n")
 
     def _print_summary(self, results: Dict[str, Any]) -> None:
         """Print summary of processing results."""
