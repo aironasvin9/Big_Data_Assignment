@@ -1,6 +1,6 @@
-# loiter.py - FINAL ULTRA-FAST VERSION
+# loiter.py
 """
-Loitering anomaly detection (Anomaly B) - PRODUCTION READY.
+Loitering anomaly detection (Anomaly B)
 Expected: <5 seconds for 3,400 vessels.
 """
 
@@ -21,7 +21,7 @@ def detect_loitering_anomalies(
     """
     Anomaly B: Detect two distinct vessels within 500m with SOG <1 knot for >2 hours.
     
-    AGGRESSIVE FILTERING: Spatial binning + distance pre-check.
+    ULTRA-OPTIMIZED: Pre-computed averages, no redundant calculations.
     Expected: <5 seconds for 3,400 vessels.
     """
     print("[Loitering] Starting ultra-fast screening...")
@@ -33,9 +33,9 @@ def detect_loitering_anomalies(
         print(f"[Loitering] Only {len(mmsi_records)} vessels. Skipping.")
         return anomalies
     
-    # FILTER 1: Pre-filter slow vessels only
-    print("[Loitering] Filter 1: Pre-filtering slow vessels...")
-    slow_vessels = {}
+    # FILTER 1: Pre-filter slow vessels ONCE and compute averages ONCE
+    print("[Loitering] Filter 1: Pre-filtering slow vessels & computing positions...")
+    slow_vessels_data = {}  # mmsi -> (records, avg_lat, avg_lon)
     
     for mmsi, records in mmsi_records.items():
         slow_records = [
@@ -45,29 +45,24 @@ def detect_loitering_anomalies(
         ]
         
         if len(slow_records) >= 2:
-            slow_vessels[mmsi] = slow_records
+            # COMPUTE AVERAGE ONLY ONCE per vessel
+            avg_lat = sum(r[2] for r in slow_records) / len(slow_records)
+            avg_lon = sum(r[3] for r in slow_records) / len(slow_records)
+            slow_vessels_data[mmsi] = (slow_records, avg_lat, avg_lon)
     
-    print(f"[Loitering] Found {len(slow_vessels)} slow vessels")
+    print(f"[Loitering] Found {len(slow_vessels_data)} slow vessels")
     
-    if len(slow_vessels) < 2:
+    if len(slow_vessels_data) < 2:
         print("[Loitering] Not enough slow vessels. Skipping.")
         return anomalies
     
-    # FILTER 2: Spatial grid to group nearby vessels
+    # FILTER 2: Spatial grid using pre-computed averages
     print("[Loitering] Filter 2: Spatial binning (10km grid)...")
     
-    grid_size = 10.0  # 10km cells
+    grid_size = 10.0
     spatial_grid: Dict[tuple, List[str]] = {}
     
-    # Build grid from slow vessels' AVERAGE position only (not all records)
-    for mmsi, records in slow_vessels.items():
-        if not records:
-            continue
-        
-        # Use average position (O(n) but fast)
-        avg_lat = sum(r[2] for r in records) / len(records)
-        avg_lon = sum(r[3] for r in records) / len(records)
-        
+    for mmsi, (records, avg_lat, avg_lon) in slow_vessels_data.items():
         grid_cell = (int(avg_lat / grid_size), int(avg_lon / grid_size))
         
         if grid_cell not in spatial_grid:
@@ -88,7 +83,7 @@ def detect_loitering_anomalies(
         
         lat_cell, lon_cell = grid_cell
         
-        # Get adjacent cells (including diagonals)
+        # Get adjacent cells
         adjacent_mmsis = set(mmsis_in_cell)
         for dlat in [-1, 0, 1]:
             for dlon in [-1, 0, 1]:
@@ -98,7 +93,7 @@ def detect_loitering_anomalies(
                 if neighbor_cell in spatial_grid:
                     adjacent_mmsis.update(spatial_grid[neighbor_cell])
         
-        # Check pairs within this cell + neighbors
+        # Check pairs using PRE-COMPUTED averages
         mmsis_list = sorted(list(adjacent_mmsis))
         for i, mmsi1 in enumerate(mmsis_list):
             for mmsi2 in mmsis_list[i+1:]:
@@ -108,18 +103,13 @@ def detect_loitering_anomalies(
                     continue
                 checked_pairs.add(pair_key)
                 
-                # Quick distance pre-check using average positions
-                rec1 = slow_vessels[mmsi1]
-                rec2 = slow_vessels[mmsi2]
+                # Use pre-computed averages - NO recalculation
+                rec1, avg_lat1, avg_lon1 = slow_vessels_data[mmsi1]
+                rec2, avg_lat2, avg_lon2 = slow_vessels_data[mmsi2]
                 
-                avg_lat1 = sum(r[2] for r in rec1) / len(rec1)
-                avg_lon1 = sum(r[3] for r in rec1) / len(rec1)
-                avg_lat2 = sum(r[2] for r in rec2) / len(rec2)
-                avg_lon2 = sum(r[3] for r in rec2) / len(rec2)
-                
-                # Pre-filter: if average positions are >100km apart, skip
+                # Pre-filter: if average positions >10km apart, skip
                 avg_dist = haversine_distance(avg_lat1, avg_lon1, avg_lat2, avg_lon2)
-                if avg_dist > 10.0:  # 10km threshold for average positions
+                if avg_dist > 10.0:
                     continue
                 
                 candidate_pairs.append((mmsi1, mmsi2, rec1, rec2))
@@ -169,8 +159,8 @@ def _check_loitering_pair_final(
         return None
     
     # Sample every Nth record (aggressive sampling)
-    sample_every_1 = max(1, len(records1) // 20)  # Sample 20 points from track 1
-    sample_every_2 = max(1, len(records2) // 20)  # Sample 20 points from track 2
+    sample_every_1 = max(1, len(records1) // 20)  # Sample 20 points
+    sample_every_2 = max(1, len(records2) // 20)
     
     proximity_count = 0
     min_dist = float('inf')
@@ -182,7 +172,6 @@ def _check_loitering_pair_final(
         rec1 = records1[i]
         ts1, epoch1, lat1, lon1, sog1, _ = rec1
         
-        # Only check points in overlap window
         if epoch1 < min_epoch or epoch1 > max_epoch:
             continue
         
