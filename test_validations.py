@@ -34,9 +34,9 @@ class TestGeoUtilities(unittest.TestCase):
     
     def test_haversine_distance_known_locations(self):
         """Test distance between known locations."""
-        # Copenhagen to Hamburg: ~170 km
+        # Copenhagen to Hamburg: ~288 km
         dist = haversine_distance(55.6761, 12.5683, 53.5511, 10.0127)
-        self.assertAlmostEqual(dist, 170, delta=5)
+        self.assertAlmostEqual(dist, 288, delta=5)
     
     def test_haversine_distance_antipodal(self):
         """Test distance between antipodal points."""
