@@ -518,6 +518,9 @@ def main():
         
         pipeline = AISPipeline(num_workers=NUM_WORKERS, chunk_size=CHUNK_SIZE)
         results = pipeline.process_file(filepath)
+        del results
+        del pipeline
+        gc.collect()
         
         print(f"\n✅ Completed processing {csv_file}")
 
