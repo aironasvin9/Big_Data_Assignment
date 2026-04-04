@@ -1,7 +1,7 @@
 # loiter.py
 """
 Loitering anomaly detection (Anomaly B)
-Streaming version - processes CSV directly without loading all records into memory.
+Intelligent multi-stage filtering to handle large files efficiently.
 """
 
 import gc
@@ -57,7 +57,7 @@ def detect_loitering_anomalies(
         return anomalies
     
     # FILTER 2: Adaptive spatial grid
-    print("[Loitering] Filter 2: Adaptive spatial grid...")
+    print("[Loitering] Filter 2: Building spatial grid...")
     
     # Find geographic bounds
     all_lats = [avg_lat for _, (_, avg_lat, _) in slow_vessels_data.items()]
@@ -69,60 +69,71 @@ def detect_loitering_anomalies(
     lat_span = max_lat - min_lat
     lon_span = max_lon - min_lon
     
-    # Adaptive grid size
-    grid_size_lat = max(0.1, lat_span / 7.0)
-    grid_size_lon = max(0.1, lon_span / 7.0)
+    # Adaptive grid size: aim for ~100-200 cells total
+    num_cells = max(10, min(200, len(slow_vessels_data) // 5))
+    grid_rows = int(num_cells ** 0.5)
+    grid_cols = int(num_cells / grid_rows) + 1
     
-    print(f"[Loitering] Geographic bounds: lat [{min_lat:.2f}, {max_lat:.2f}], "
-          f"lon [{min_lon:.2f}, {max_lon:.2f}]")
-    print(f"[Loitering] Grid cell sizes: {grid_size_lat:.3f}° × {grid_size_lon:.3f}°")
+    grid_size_lat = max(0.01, lat_span / grid_rows) if lat_span > 0 else 1.0
+    grid_size_lon = max(0.01, lon_span / grid_cols) if lon_span > 0 else 1.0
+    
+    print(f"[Loitering] Grid: {grid_rows}x{grid_cols} = {grid_rows*grid_cols} cells")
+    print(f"[Loitering] Cell sizes: {grid_size_lat:.3f}° × {grid_size_lon:.3f}°")
     
     spatial_grid: Dict[tuple, List[str]] = {}
     
     for mmsi, (records, avg_lat, avg_lon) in slow_vessels_data.items():
-        lat_cell = int((avg_lat - min_lat) / grid_size_lat)
-        lon_cell = int((avg_lon - min_lon) / grid_size_lon)
+        lat_cell = int((avg_lat - min_lat) / grid_size_lat) if grid_size_lat > 0 else 0
+        lon_cell = int((avg_lon - min_lon) / grid_size_lon) if grid_size_lon > 0 else 0
         grid_cell = (lat_cell, lon_cell)
         
         if grid_cell not in spatial_grid:
             spatial_grid[grid_cell] = []
         spatial_grid[grid_cell].append(mmsi)
     
-    print(f"[Loitering] Built spatial grid with {len(spatial_grid)} cells")
+    print(f"[Loitering] Built spatial grid with {len(spatial_grid)} active cells")
     
-    # Show distribution
-    cell_sizes = sorted([len(mmsis) for mmsis in spatial_grid.values()])
-    print(f"[Loitering] Cell distribution: min={cell_sizes[0]}, "
-          f"median={cell_sizes[len(cell_sizes)//2]}, max={cell_sizes[-1]}")
+    # FILTER 3: Pre-compute distance matrix for grid cells
+    print("[Loitering] Filter 3: Computing cell-to-cell distances...")
+    cell_centers = {}
+    for cell, mmsis in spatial_grid.items():
+        lat_cell, lon_cell = cell
+        center_lat = min_lat + (lat_cell + 0.5) * grid_size_lat
+        center_lon = min_lon + (lon_cell + 0.5) * grid_size_lon
+        cell_centers[cell] = (center_lat, center_lon)
     
-    # FILTER 3: Check only adjacent cells
-    print("[Loitering] Filter 3: Checking adjacent cells...")
+    # Find which cells are close to each other
+    close_cell_pairs: Set[Tuple[tuple, tuple]] = set()
+    cell_list = list(spatial_grid.keys())
+    for i, cell1 in enumerate(cell_list):
+        lat1, lon1 = cell_centers[cell1]
+        for cell2 in cell_list[i+1:]:
+            lat2, lon2 = cell_centers[cell2]
+            dist = haversine_distance(lat1, lon1, lat2, lon2)
+            
+            # Only keep cell pairs within 50km (will refine later)
+            if dist <= 50.0:
+                close_cell_pairs.add((min(cell1, cell2), max(cell1, cell2)))
+    
+    print(f"[Loitering] Found {len(close_cell_pairs)} close cell pairs")
+    
+    # FILTER 4: Check only vessel pairs in close cells
+    print("[Loitering] Filter 4: Screening vessel pairs in close cells...")
     
     checked_pairs: Set[tuple] = set()
     candidate_pairs = []
     
-    for grid_cell, mmsis_in_cell in spatial_grid.items():
-        if len(mmsis_in_cell) < 2:
-            continue
+    for cell1, cell2 in close_cell_pairs:
+        mmsis1 = spatial_grid[cell1]
+        mmsis2 = spatial_grid[cell2]
         
-        lat_cell, lon_cell = grid_cell
-        
-        # Get adjacent cells
-        adjacent_mmsis = set(mmsis_in_cell)
-        for dlat in [-1, 0, 1]:
-            for dlon in [-1, 0, 1]:
-                if dlat == 0 and dlon == 0:
+        # Check all pairs between these two cells
+        for mmsi1 in mmsis1:
+            for mmsi2 in mmsis2:
+                if mmsi1 >= mmsi2:  # Avoid duplicates
                     continue
-                neighbor_cell = (lat_cell + dlat, lon_cell + dlon)
-                if neighbor_cell in spatial_grid:
-                    adjacent_mmsis.update(spatial_grid[neighbor_cell])
-        
-        # Check pairs using pre-computed averages
-        mmsis_list = sorted(list(adjacent_mmsis))
-        for i, mmsi1 in enumerate(mmsis_list):
-            for mmsi2 in mmsis_list[i+1:]:
-                pair_key = tuple(sorted([mmsi1, mmsi2]))
                 
+                pair_key = (mmsi1, mmsi2)
                 if pair_key in checked_pairs:
                     continue
                 checked_pairs.add(pair_key)
@@ -137,14 +148,14 @@ def detect_loitering_anomalies(
                 
                 candidate_pairs.append((mmsi1, mmsi2, rec1, rec2))
     
-    print(f"[Loitering] Found {len(candidate_pairs)} candidate pairs")
+    print(f"[Loitering] Found {len(candidate_pairs)} candidate pairs (from {len(checked_pairs)} checked)")
     
-    # FILTER 4: Detailed check
+    # FILTER 5: Detailed check on candidates
     if candidate_pairs:
-        print(f"[Loitering] Filter 4: Detail checking {len(candidate_pairs)} candidates...")
+        print(f"[Loitering] Filter 5: Detail checking {len(candidate_pairs)} candidates...")
         
         for idx, (mmsi1, mmsi2, rec1, rec2) in enumerate(candidate_pairs):
-            if idx % max(1, len(candidate_pairs) // 10) == 0:
+            if idx % max(1, len(candidate_pairs) // 10) == 0 and idx > 0:
                 print(f"[Loitering]   {idx:,} / {len(candidate_pairs):,}...")
             
             result = _check_loitering_pair_final(
@@ -166,12 +177,10 @@ def detect_loitering_anomalies_streaming(
     loitering_duration_hours: float = LOITERING_DURATION_HOURS,
 ) -> List[Dict[str, Any]]:
     """
-    Loitering detection directly from CSV file - STREAMING.
-    Avoids loading all records into main memory.
-    
-    Memory usage: ~100MB (only slow vessels kept in memory)
+    Loitering detection directly from CSV file - STREAMING with aggressive filtering.
+    Memory usage: ~200MB max (streaming + filtered candidates only)
     """
-    print("[Loitering] Starting streaming detection from file...")
+    print("[Loitering] Starting streaming detection (aggressive filtering mode)...")
     
     anomalies = []
     loitering_sec = loitering_duration_hours * 3600
@@ -182,7 +191,6 @@ def detect_loitering_anomalies_streaming(
     total_scanned = 0
     
     for mmsi, ts_str, epoch, lat, lon, sog, draught in stream_valid_rows(filepath):
-        # Only keep slow vessels
         if sog <= sog_threshold_knots:
             slow_vessels_data[mmsi].append((ts_str, epoch, lat, lon, sog, draught))
         
@@ -199,7 +207,7 @@ def detect_loitering_anomalies_streaming(
         print("[Loitering] Not enough slow vessels for loitering. Skipping.")
         return anomalies
     
-    # PHASE 2: Compute positions (pre-computed averages)
+    # PHASE 2: Compute positions
     print("[Loitering] Phase 2: Computing vessel positions...")
     vessel_positions = {}
     for mmsi, records in slow_vessels_data.items():
@@ -207,8 +215,8 @@ def detect_loitering_anomalies_streaming(
         avg_lon = sum(r[3] for r in records) / len(records)
         vessel_positions[mmsi] = (avg_lat, avg_lon)
     
-    # PHASE 3: Spatial grid
-    print("[Loitering] Phase 3: Building spatial grid...")
+    # PHASE 3: Build spatial grid with FINER granularity
+    print("[Loitering] Phase 3: Building adaptive spatial grid...")
     
     all_lats = [lat for lat, lon in vessel_positions.values()]
     all_lons = [lon for lat, lon in vessel_positions.values()]
@@ -219,50 +227,65 @@ def detect_loitering_anomalies_streaming(
     lat_span = max_lat - min_lat
     lon_span = max_lon - min_lon
     
-    grid_size_lat = max(0.1, lat_span / 7.0)
-    grid_size_lon = max(0.1, lon_span / 7.0)
+    # Create finer grid: aim for ~5-10 vessels per cell
+    num_cells = max(50, min(500, len(vessel_positions) // 8))
+    grid_rows = int(num_cells ** 0.5)
+    grid_cols = int(num_cells / grid_rows) + 1
     
-    print(f"[Loitering] Geographic bounds: lat [{min_lat:.2f}, {max_lat:.2f}], "
-          f"lon [{min_lon:.2f}, {max_lon:.2f}]")
-    print(f"[Loitering] Grid cell sizes: {grid_size_lat:.3f}° × {grid_size_lon:.3f}°")
+    grid_size_lat = max(0.01, lat_span / grid_rows) if lat_span > 0 else 1.0
+    grid_size_lon = max(0.01, lon_span / grid_cols) if lon_span > 0 else 1.0
+    
+    print(f"[Loitering] Grid: {grid_rows}x{grid_cols} = {grid_rows*grid_cols} cells")
     
     spatial_grid = defaultdict(list)
     for mmsi, (lat, lon) in vessel_positions.items():
-        lat_cell = int((lat - min_lat) / grid_size_lat)
-        lon_cell = int((lon - min_lon) / grid_size_lon)
+        lat_cell = int((lat - min_lat) / grid_size_lat) if grid_size_lat > 0 else 0
+        lon_cell = int((lon - min_lon) / grid_size_lon) if grid_size_lon > 0 else 0
         spatial_grid[(lat_cell, lon_cell)].append(mmsi)
     
-    print(f"[Loitering] Built grid with {len(spatial_grid)} cells")
+    print(f"[Loitering] Built grid with {len(spatial_grid)} active cells")
+    cell_sizes = [len(mmsis) for mmsis in spatial_grid.values()]
+    print(f"[Loitering] Cell sizes: min={min(cell_sizes)}, avg={sum(cell_sizes)//len(cell_sizes)}, max={max(cell_sizes)}")
     
-    # Show distribution
-    cell_sizes = sorted([len(mmsis) for mmsis in spatial_grid.values()])
-    print(f"[Loitering] Cell distribution: min={cell_sizes[0]}, "
-          f"median={cell_sizes[len(cell_sizes)//2]}, max={cell_sizes[-1]}")
+    # PHASE 4: Find candidate pairs ONLY from close cells
+    print("[Loitering] Phase 4: Finding candidate pairs from close cells...")
     
-    # PHASE 4: Find candidate pairs
-    print("[Loitering] Phase 4: Finding candidate pairs...")
+    # Pre-compute cell centers
+    cell_centers = {}
+    for cell in spatial_grid.keys():
+        lat_cell, lon_cell = cell
+        center_lat = min_lat + (lat_cell + 0.5) * grid_size_lat
+        center_lon = min_lon + (lon_cell + 0.5) * grid_size_lon
+        cell_centers[cell] = (center_lat, center_lon)
+    
+    # Find close cell pairs
+    close_cell_pairs: Set[Tuple[tuple, tuple]] = set()
+    cell_list = list(spatial_grid.keys())
+    for i, cell1 in enumerate(cell_list):
+        lat1, lon1 = cell_centers[cell1]
+        for cell2 in cell_list[i+1:]:
+            lat2, lon2 = cell_centers[cell2]
+            dist = haversine_distance(lat1, lon1, lat2, lon2)
+            
+            if dist <= 50.0:  # Pre-filter
+                close_cell_pairs.add((min(cell1, cell2), max(cell1, cell2)))
+    
+    print(f"[Loitering] Found {len(close_cell_pairs)} close cell pairs")
+    
+    # Collect candidate vessel pairs
     checked_pairs = set()
     candidate_pairs = []
     
-    for grid_cell, mmsis_in_cell in spatial_grid.items():
-        if len(mmsis_in_cell) < 2:
-            continue
+    for cell1, cell2 in close_cell_pairs:
+        mmsis1 = spatial_grid[cell1]
+        mmsis2 = spatial_grid[cell2]
         
-        lat_cell, lon_cell = grid_cell
-        adjacent_mmsis = set(mmsis_in_cell)
-        
-        for dlat in [-1, 0, 1]:
-            for dlon in [-1, 0, 1]:
-                if dlat == 0 and dlon == 0:
+        for mmsi1 in mmsis1:
+            for mmsi2 in mmsis2:
+                if mmsi1 >= mmsi2:
                     continue
-                neighbor = (lat_cell + dlat, lon_cell + dlon)
-                if neighbor in spatial_grid:
-                    adjacent_mmsis.update(spatial_grid[neighbor])
-        
-        mmsis_list = sorted(list(adjacent_mmsis))
-        for i, mmsi1 in enumerate(mmsis_list):
-            for mmsi2 in mmsis_list[i+1:]:
-                pair_key = tuple(sorted([mmsi1, mmsi2]))
+                
+                pair_key = (mmsi1, mmsi2)
                 if pair_key in checked_pairs:
                     continue
                 checked_pairs.add(pair_key)
@@ -271,19 +294,19 @@ def detect_loitering_anomalies_streaming(
                 lat2, lon2 = vessel_positions[mmsi2]
                 
                 avg_dist = haversine_distance(lat1, lon1, lat2, lon2)
-                if avg_dist > 50.0:  # Pre-filter
+                if avg_dist > 50.0:
                     continue
                 
                 rec1 = slow_vessels_data[mmsi1]
                 rec2 = slow_vessels_data[mmsi2]
                 candidate_pairs.append((mmsi1, mmsi2, rec1, rec2))
     
-    print(f"[Loitering] Found {len(candidate_pairs)} candidate pairs")
+    print(f"[Loitering] Found {len(candidate_pairs)} candidate pairs to check")
     
     # PHASE 5: Detail check
     print(f"[Loitering] Phase 5: Detail checking {len(candidate_pairs)} candidates...")
     for idx, (mmsi1, mmsi2, rec1, rec2) in enumerate(candidate_pairs):
-        if idx % max(1, len(candidate_pairs) // 10) == 0:
+        if idx % max(1, len(candidate_pairs) // 10) == 0 and idx > 0:
             print(f"[Loitering]   {idx:,} / {len(candidate_pairs):,}...")
         
         result = _check_loitering_pair_final(
@@ -306,7 +329,7 @@ def _check_loitering_pair_final(
     proximity_threshold_km: float,
     loitering_sec: int,
 ) -> Dict[str, Any]:
-    """Final proximity check with sampling."""
+    """Final proximity check with aggressive sampling."""
     
     min_epoch = max(records1[0][1], records2[0][1])
     max_epoch = min(records1[-1][1], records2[-1][1])
@@ -315,9 +338,9 @@ def _check_loitering_pair_final(
     if overlap_duration < loitering_sec:
         return None
     
-    # Sample records
-    sample_every_1 = max(1, len(records1) // 20)
-    sample_every_2 = max(1, len(records2) // 20)
+    # Aggressive sampling: only check 10 points per vessel
+    sample_every_1 = max(1, len(records1) // 10)
+    sample_every_2 = max(1, len(records2) // 10)
     
     proximity_count = 0
     min_dist = float('inf')
@@ -335,7 +358,8 @@ def _check_loitering_pair_final(
             rec2 = records2[j]
             ts2, epoch2, lat2, lon2, sog2, _ = rec2
             
-            if abs(epoch1 - epoch2) > 900:
+            # Time match: within 30 minutes
+            if abs(epoch1 - epoch2) > 1800:
                 continue
             
             dist = haversine_distance(lat1, lon1, lat2, lon2)
@@ -348,6 +372,7 @@ def _check_loitering_pair_final(
                     first_ts = ts1
                 last_ts = ts1
     
+    # Need at least 3 proximity events to flag
     if proximity_count >= 3 and min_dist < float('inf'):
         return {
             'mmsi_vessel1': mmsi1,
