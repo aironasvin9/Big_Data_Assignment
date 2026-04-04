@@ -38,7 +38,8 @@ COL_IMO = 10
 COL_CALLSIGN = 11
 COL_NAME = 12
 COL_SHIP_TYPE = 13
-COL_DRAUGHT = 18
+COL_CARGO = 14
+COL_DRAUGHT = 15
 
 # ============================================================================
 # PROCESSING PARAMETERS
