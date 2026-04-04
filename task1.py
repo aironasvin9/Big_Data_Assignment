@@ -1,18 +1,16 @@
 """
 Command-line interface for Two-Pass Shadow Fleet Detection.
-
-PASS 1: Parallel detection (A, C, D)
-PASS 2: Loitering detection (B) - BATCH VERSION
-PASS 3: Scoring & Output
+Pass 1: Parallel detection (A, C, D)
+Pass 2: Loitering detection (B) - BATCH VERSION (adjusted)
 """
 
+import csv
 import os
 import time
 import gc
-import csv
+import json
 import resource
 import multiprocessing as mp
-
 from typing import Dict, Any, List, Tuple
 from collections import defaultdict
 from multiprocessing import Process, Queue, Value
@@ -20,25 +18,22 @@ from multiprocessing.sharedctypes import Synchronized
 
 from config import (
     NUM_WORKERS, CHUNK_SIZE, ANALYSIS_DIR, OUTPUT_DIRS,
-    TOP_N_VESSELS
+    TOP_N_GOING_DARK, TOP_N_VESSELS
 )
-
 from partition import create_mmsi_partitioned_chunks, route_chunk_to_workers
-
 from detect import (
     detect_going_dark_anomalies,
     detect_teleportation_anomalies,
     detect_draft_change_anomalies,
 )
-
-from loiter import detect_loitering_anomalies
-
+from loiter import detect_loitering_anomalies  # 👈 changed import
 from scoring import (
+    calculate_dfsi,
     aggregate_anomalies_by_vessel,
     rank_vessels_by_dfsi,
 )
-
-from parsing import stream_valid_rows
+from parsing import stream_csv_rows, is_valid_mmsi, stream_valid_rows
+from geo import is_valid_coordinate
 
 
 # =====================================================================
@@ -53,7 +48,7 @@ def get_memory_usage_mb() -> float:
 
 
 # =====================================================================
-# WORKER PROCESS (PASS 1)
+# WORKER PROCESS (UNCHANGED)
 # =====================================================================
 def worker_process(
     worker_id: int,
@@ -62,10 +57,11 @@ def worker_process(
     stop_flag: Synchronized,
 ) -> None:
 
-    mmsi_data: Dict[str, List[Tuple]] = defaultdict(list)
+    processed_chunks = 0
     total_records = 0
+    mmsi_data: Dict[str, List[Tuple]] = defaultdict(list)
 
-    print(f"[Worker {worker_id}] Started")
+    print(f"[Worker {worker_id}] Started (Pass 1)")
 
     while not stop_flag.value:
         try:
@@ -77,10 +73,12 @@ def worker_process(
                 mmsi_data[mmsi].extend(records)
                 total_records += len(records)
 
+            processed_chunks += 1
+
         except Exception:
             continue
 
-    print(f"[Worker {worker_id}] Detecting anomalies...")
+    print(f"[Worker {worker_id}] Starting anomaly detection...")
 
     all_anomalies = []
 
@@ -96,13 +94,14 @@ def worker_process(
 
     result_queue.put({
         'worker_id': worker_id,
+        'processed_chunks': processed_chunks,
         'total_records': total_records,
-        'anomalies': all_anomalies,
         'mmsi_counts': {m: len(r) for m, r in mmsi_data.items()},
-        'memory': get_memory_usage_mb()
+        'anomalies': all_anomalies,
+        'final_memory_mb': get_memory_usage_mb(),
     })
 
-    print(f"[Worker {worker_id}] Done — {len(all_anomalies)} anomalies")
+    print(f"[Worker {worker_id}] Finished — {len(all_anomalies)} anomalies")
 
 
 # =====================================================================
@@ -110,156 +109,154 @@ def worker_process(
 # =====================================================================
 class AISPipeline:
 
-    def __init__(self, num_workers=NUM_WORKERS, chunk_size=CHUNK_SIZE):
+    def __init__(self, num_workers: int = NUM_WORKERS, chunk_size: int = CHUNK_SIZE):
         self.num_workers = num_workers
         self.chunk_size = chunk_size
 
-        self.worker_queues = [Queue(maxsize=8) for _ in range(num_workers)]
-        self.result_queue = Queue()
+        self.worker_queues: List[Queue] = [Queue(maxsize=8) for _ in range(num_workers)]
+        self.result_queue: Queue = Queue()
         self.stop_flag = Value('b', False)
         self.workers: List[Process] = []
 
-        for d in OUTPUT_DIRS:
-            os.makedirs(d, exist_ok=True)
+        for dir_path in OUTPUT_DIRS:
+            os.makedirs(dir_path, exist_ok=True)
 
-    # --------------------------------------------------
-    def start_workers(self):
+    def start_workers(self) -> None:
         for i in range(self.num_workers):
-            p = Process(
+            worker = Process(
                 target=worker_process,
                 args=(i, self.worker_queues[i], self.result_queue, self.stop_flag),
             )
-            p.start()
-            self.workers.append(p)
+            worker.start()
+            self.workers.append(worker)
 
-    # --------------------------------------------------
-    def stop_workers(self):
+    def stop_workers(self) -> None:
         self.stop_flag.value = True
         for q in self.worker_queues:
             q.put(None)
 
-    # --------------------------------------------------
-    def route_chunk(self, chunk):
+    def _route_chunk(self, chunk: Dict) -> None:
         worker_chunks = route_chunk_to_workers(chunk, self.num_workers)
-        for wid, sub in worker_chunks.items():
-            self.worker_queues[wid].put(sub)
+        for worker_id, sub_chunk in worker_chunks.items():
+            self.worker_queues[worker_id].put(sub_chunk)
 
-    # --------------------------------------------------
-    def wait_workers(self):
-        for w in self.workers:
-            w.join()
+    def wait_for_workers(self) -> None:
+        for worker in self.workers:
+            worker.join()
         self.workers = []
 
-    # --------------------------------------------------
+    # =================================================================
     def process_file(self, filepath: str) -> Dict[str, Any]:
 
-        start = time.time()
+        start_time = time.time()
 
-        print("\n=== PASS 1: Parallel Detection ===\n")
+        print("\n" + "="*70)
+        print("PASS 1: Parallel Detection (A, C, D)")
+        print("="*70 + "\n")
+
+        pass1_start = time.time()
 
         self.start_workers()
 
-        chunk_count = 0
+        chunks_sent = 0
 
         for chunk in create_mmsi_partitioned_chunks(filepath, self.chunk_size):
-            self.route_chunk(chunk)
-            chunk_count += 1
+            self._route_chunk(chunk)
+            chunks_sent += 1
 
-        print(f"[Main] Sent {chunk_count} chunks")
+            if chunks_sent % 100 == 0:
+                print(f"[Main] Dispatched {chunks_sent} chunks")
+
+        print(f"\n[Main] Finished streaming, sent {chunks_sent} chunks")
 
         self.stop_workers()
 
-        pass1_results = self.collect_results()
-        self.wait_workers()
+        pass1_results = self._aggregate_results()
+        self.wait_for_workers()
 
-        pass1_time = time.time() - start
-        print(f"[Main] PASS 1 done in {pass1_time:.2f}s")
+        pass1_time = time.time() - pass1_start
 
-        # ==========================================================
-        # PASS 2 (BATCH LOITERING)
-        # ==========================================================
-        print("\n=== PASS 2: Loitering (Batch) ===\n")
+        print(f"\n[Main] PASS 1 completed in {pass1_time:.2f} seconds")
 
-        t2 = time.time()
+        # =================================================================
+        # PASS 2 — 🔥 ONLY PART WE CHANGED
+        # =================================================================
+        print("\n" + "="*70)
+        print("PASS 2: Loitering Detection (Batch Version)")
+        print("="*70 + "\n")
+
+        pass2_start = time.time()
+
+        print("[Main] Building MMSI records...")
 
         mmsi_records = defaultdict(list)
 
-        for mmsi, ts, epoch, lat, lon, sog, draught in stream_valid_rows(filepath):
-            mmsi_records[mmsi].append((ts, epoch, lat, lon, sog, draught))
+        for mmsi, ts_str, epoch, lat, lon, sog, draught in stream_valid_rows(filepath):
+            mmsi_records[mmsi].append((ts_str, epoch, lat, lon, sog, draught))
 
         for recs in mmsi_records.values():
             recs.sort(key=lambda r: r[1])
 
-        loitering = detect_loitering_anomalies(mmsi_records)
+        print(f"[Main] Built records for {len(mmsi_records)} vessels")
 
-        pass2_time = time.time() - t2
+        loitering_anomalies = detect_loitering_anomalies(mmsi_records)
 
-        print(f"[Main] PASS 2 done in {pass2_time:.2f}s")
+        pass2_time = time.time() - pass2_start
 
-        # ==========================================================
+        print(f"\n[Main] PASS 2 completed in {pass2_time:.2f} seconds")
+
+        # =================================================================
         # PASS 3
-        # ==========================================================
-        print("\n=== PASS 3: Scoring ===\n")
+        # =================================================================
+        print("\n" + "="*70)
+        print("PASS 3: Scoring & Ranking")
+        print("="*70 + "\n")
 
-        all_anomalies = pass1_results['anomalies'] + loitering
+        all_anomalies = pass1_results['anomalies'] + loitering_anomalies
 
-        vessels = aggregate_anomalies_by_vessel(all_anomalies)
-        ranked = rank_vessels_by_dfsi(vessels, TOP_N_VESSELS)
+        vessels_dict = aggregate_anomalies_by_vessel(all_anomalies)
+        top_vessels = rank_vessels_by_dfsi(vessels_dict, TOP_N_VESSELS)
 
-        self.save_results(all_anomalies)
-
-        total_time = time.time() - start
+        end_time = time.time()
+        elapsed = end_time - start_time
 
         print("\n=== DONE ===")
-        print(f"Total time: {total_time:.2f}s")
+        print(f"Total time: {elapsed:.2f}s")
         print(f"Total anomalies: {len(all_anomalies)}")
 
         return {
-            "pass1_seconds": pass1_time,
-            "pass2_seconds": pass2_time,
-            "total": total_time,
+            'pass1_seconds': pass1_time,
+            'pass2_seconds': pass2_time,
+            'total': elapsed,
         }
 
-    # --------------------------------------------------
-    def collect_results(self):
-        anomalies = []
+    # =================================================================
+    def _aggregate_results(self) -> Dict[str, Any]:
+
         total_records = 0
-        mmsi_counts = defaultdict(int)
+        combined_mmsi_counts = defaultdict(int)
+        all_anomalies = []
 
-        received = 0
+        results_received = 0
 
-        while received < self.num_workers:
-            res = self.result_queue.get()
-            anomalies.extend(res['anomalies'])
-            total_records += res['total_records']
+        while results_received < self.num_workers:
+            result = self.result_queue.get()
 
-            for m, c in res['mmsi_counts'].items():
-                mmsi_counts[m] += c
+            total_records += result['total_records']
 
-            received += 1
+            for mmsi, count in result['mmsi_counts'].items():
+                combined_mmsi_counts[mmsi] += count
+
+            all_anomalies.extend(result['anomalies'])
+
+            results_received += 1
 
         return {
-            'anomalies': anomalies,
             'total_records': total_records,
-            'mmsi_counts': dict(mmsi_counts),
+            'unique_vessels': len(combined_mmsi_counts),
+            'mmsi_counts': dict(combined_mmsi_counts),
+            'anomalies': all_anomalies,
         }
-
-    # --------------------------------------------------
-    def save_results(self, anomalies):
-
-        print("\n[Analysis] Writing CSV...")
-
-        os.makedirs(ANALYSIS_DIR, exist_ok=True)
-
-        with open(os.path.join(ANALYSIS_DIR, "all_anomalies.csv"), "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=['mmsi', 'anomaly_type'])
-            writer.writeheader()
-
-            for a in anomalies:
-                writer.writerow({
-                    'mmsi': a.get('mmsi', a.get('mmsi_vessel1')),
-                    'anomaly_type': a.get('anomaly_type'),
-                })
 
 
 # =====================================================================
@@ -269,16 +266,15 @@ def main():
 
     data_dir = "./data"
 
-    files = [f for f in os.listdir(data_dir) if f.endswith(".csv")]
+    csv_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
 
-    if not files:
+    if not csv_files:
         print("No CSV files found.")
         return
 
-    filepath = os.path.join(data_dir, files[0])
+    filepath = os.path.join(data_dir, csv_files[0])
 
     pipeline = AISPipeline()
-
     pipeline.process_file(filepath)
 
 
