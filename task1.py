@@ -1,141 +1,449 @@
-# Task 1: Low-Memory Parallel Partitioning for Maritime Shadow Fleet Detection
+# task1.py
+"""
+Command-line interface for Two-Pass Shadow Fleet Detection.
+Pass 1: Parallel detection (A, C, D)
+Pass 2: Loitering detection (B)
+"""
 
 import os
+import time
+import gc
+import json
+import resource
 import multiprocessing as mp
+from typing import Dict, Any, List, Tuple
 from collections import defaultdict
-from typing import Dict, Any
-from utils import stream_csv_rows, is_valid_mmsi, is_valid_coordinate, StreamingPartitioner
+from multiprocessing import Process, Queue, Value
+from multiprocessing.sharedctypes import Synchronized
+
+from config import (
+    NUM_WORKERS, CHUNK_SIZE, ANALYSIS_DIR, OUTPUT_DIRS,
+    TOP_N_GOING_DARK, TOP_N_VESSELS
+)
+from partition import create_mmsi_partitioned_chunks, route_chunk_to_workers
+from detect import (
+    detect_going_dark_anomalies,
+    detect_teleportation_anomalies,
+    detect_draft_change_anomalies,
+)
+from loiter import detect_loitering_anomalies
+from scoring import (
+    calculate_dfsi,
+    aggregate_anomalies_by_vessel,
+    rank_vessels_by_dfsi,
+)
+from parsing import stream_csv_rows, is_valid_mmsi, stream_valid_rows
+from geo import is_valid_coordinate
 
 
-# CONFIGURATION & CONSTANTS
+def get_memory_usage_mb() -> float:
+    """Get current memory usage in MB."""
+    try:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        return usage.ru_maxrss / (1024 * 1024)
+    except Exception:
+        return 0.0
 
-INVALID_MMSI_PATTERNS = {
-    '000000000',
-    '111111111',
-    '222222222',
-    '333333333',
-    '444444444',
-    '555555555',
-    '666666666',
-    '777777777',
-    '123456789',
-    '999999999',
-    '012345678',
-    '987654321',
-    '000000001',
-    '888888888',
-}
 
-INVALID_MMSI_PREFIXES = ('0000', '1111', '9999',)
-EXPECTED_MMSI_LENGTH = 9
-MAX_RECORDS_PER_MMSI_CHUNK = 50000
-CHUNK_SIZE = 10000
-NUM_WORKERS = max(1, mp.cpu_count() - 2)
-
-# Column indices based on the AIS data structure
-COL_TIMESTAMP = 0
-COL_TYPE_OF_MOBILE = 1
-COL_MMSI = 2
-COL_LATITUDE = 3
-COL_LONGITUDE = 4
-COL_NAV_STATUS = 5
-COL_ROT = 6
-COL_SOG = 7
-COL_COG = 8
-COL_HEADING = 9
-COL_IMO = 10
-COL_CALLSIGN = 11
-COL_NAME = 12
-COL_SHIP_TYPE = 13
-COL_DRAUGHT = 18
-
-# STATISTICS COLLECTOR (for analysis without full processing)
-# =============================================================================
-
-def collect_file_statistics(filepath: str, sample_size: int = 100000) -> Dict[str, Any]:
+def worker_process(
+    worker_id: int,
+    task_queue: Queue,
+    result_queue: Queue,
+    stop_flag: Synchronized,
+) -> None:
     """
-    Quickly collect statistics about the file without full processing.
-    
-    Useful for understanding data distribution before running full parallel job.
-    
-    Args:
-        filepath: Path to CSV file
-        sample_size: Number of rows to sample
-        
-    Returns:
-        Dictionary with statistics
+    Worker process: PASS 1 - Detect anomalies A, C, D.
     """
-    print(f"Collecting statistics from {os.path.basename(filepath)}...")
-    print(f"Sampling first {sample_size:,} rows...")
-    
-    valid_rows = 0
-    invalid_mmsi = 0
-    invalid_coords = 0
-    mmsi_sample: Dict[str, int] = defaultdict(int)
-    mobile_types: Dict[str, int] = defaultdict(int)
-    
-    row_count = 0
-    
-    for row in stream_csv_rows(filepath, skip_header=True):
-        row_count += 1
-        if row_count == 1:  # Skip header
+    processed_chunks = 0
+    total_records = 0
+    mmsi_data: Dict[str, List[Tuple]] = defaultdict(list)
+
+    print(f"[Worker {worker_id}] Started (Pass 1: Detect A, C, D)")
+
+    # Phase 1: Accumulate records
+    while not stop_flag.value:
+        try:
+            chunk = task_queue.get(timeout=0.2)
+            if chunk is None:
+                break
+
+            for mmsi, records in chunk.items():
+                mmsi_data[mmsi].extend(records)
+                total_records += len(records)
+
+            processed_chunks += 1
+            if processed_chunks % 100 == 0:
+                mem_mb = get_memory_usage_mb()
+                print(
+                    f"[Worker {worker_id}] {processed_chunks} chunks, "
+                    f"{total_records:,} records, {len(mmsi_data)} vessels, Mem: {mem_mb:.1f}MB"
+                )
+
+        except Exception as e:
+            if "Empty" not in str(type(e).__name__):
+                print(f"[Worker {worker_id}] Error: {e}")
             continue
-        if row_count > sample_size + 1:
-            break
-            
-        if len(row) > COL_MMSI:
-            mmsi = row[COL_MMSI].strip()
-            
-            if not is_valid_mmsi(mmsi, EXPECTED_MMSI_LENGTH, INVALID_MMSI_PATTERNS, INVALID_MMSI_PREFIXES):
-                invalid_mmsi += 1
-            else:
-                mmsi_sample[mmsi] += 1
-                valid_rows += 1
+
+    # Phase 2: Detect A, C, D anomalies
+    print(f"[Worker {worker_id}] Starting anomaly detection...")
+    going_dark_anomalies = []
+    teleportation_anomalies = []
+    draft_change_anomalies = []
+    
+    for mmsi, records in mmsi_data.items():
+        if len(records) < 2:
+            continue
+        records.sort(key=lambda r: r[1])
         
-        if len(row) > COL_LATITUDE:
-            lat = row[COL_LATITUDE] if len(row) > COL_LATITUDE else ""
-            lon = row[COL_LONGITUDE] if len(row) > COL_LONGITUDE else ""
-            if not is_valid_coordinate(lat, lon):
-                invalid_coords += 1
-        
-        if len(row) > COL_TYPE_OF_MOBILE:
-            mobile_types[row[COL_TYPE_OF_MOBILE]] += 1
+        going_dark_anomalies.extend(detect_going_dark_anomalies(mmsi, records))
+        teleportation_anomalies.extend(detect_teleportation_anomalies(mmsi, records))
+        draft_change_anomalies.extend(detect_draft_change_anomalies(mmsi, records))
     
-    stats = {
-        'sampled_rows': row_count - 1,  # Exclude header
-        'valid_rows': valid_rows,
-        'invalid_mmsi_count': invalid_mmsi,
-        'invalid_mmsi_percent': (invalid_mmsi / (row_count - 1)) * 100 if row_count > 1 else 0,
-        'invalid_coords_count': invalid_coords,
-        'unique_mmsi_in_sample': len(mmsi_sample),
-        'mobile_types': dict(mobile_types),
-        'top_mmsi': sorted(mmsi_sample.items(), key=lambda x: x[1], reverse=True)[:10]
-    }
+    all_anomalies = going_dark_anomalies + teleportation_anomalies + draft_change_anomalies
+
+    result_queue.put({
+        'worker_id': worker_id,
+        'processed_chunks': processed_chunks,
+        'total_records': total_records,
+        'mmsi_counts': {mmsi: len(recs) for mmsi, recs in mmsi_data.items()},
+        'anomalies': all_anomalies,
+        'going_dark': going_dark_anomalies,
+        'teleportation': teleportation_anomalies,
+        'draft_change': draft_change_anomalies,
+        'mmsi_records': dict(mmsi_data),
+        'final_memory_mb': get_memory_usage_mb(),
+    })
     
-    print("\nStatistics Summary:")
-    print(f"  Sampled rows: {stats['sampled_rows']:,}")
-    print(f"  Valid rows: {stats['valid_rows']:,}")
-    print(f"  Invalid MMSI: {stats['invalid_mmsi_count']:,} ({stats['invalid_mmsi_percent']:.2f}%)")
-    print(f"  Invalid coordinates: {stats['invalid_coords_count']:,}")
-    print(f"  Unique vessels in sample: {stats['unique_mmsi_in_sample']:,}")
-    print("\n  Mobile types distribution:")
-    for mobile_type, count in sorted(stats['mobile_types'].items(), key=lambda x: x[1], reverse=True):
-        print(f"    {mobile_type}: {count:,}")
-    
-    return stats
+    print(
+        f"[Worker {worker_id}] Finished — {total_records:,} records, "
+        f"{len(all_anomalies)} total anomalies "
+        f"(A: {len(going_dark_anomalies)}, D: {len(teleportation_anomalies)}, C: {len(draft_change_anomalies)})"
+    )
 
 
-# =============================================================================
-# MAIN ENTRY POINT
-# =============================================================================
+class AISPipeline:
+    """Main orchestration pipeline with TWO-PASS processing."""
+
+    def __init__(self, num_workers: int = NUM_WORKERS, chunk_size: int = CHUNK_SIZE):
+        self.num_workers = num_workers
+        self.chunk_size = chunk_size
+        self.worker_queues: List[Queue] = [Queue(maxsize=8) for _ in range(num_workers)]
+        self.result_queue: Queue = Queue()
+        self.stop_flag = Value('b', False)
+        self.workers: List[Process] = []
+        
+        # Create output directories
+        for dir_path in OUTPUT_DIRS:
+            os.makedirs(dir_path, exist_ok=True)
+
+    def start_workers(self) -> None:
+        """Start all worker processes."""
+        for i in range(self.num_workers):
+            worker = Process(
+                target=worker_process,
+                args=(i, self.worker_queues[i], self.result_queue, self.stop_flag),
+            )
+            worker.start()
+            self.workers.append(worker)
+        print(f"Started {self.num_workers} worker processes")
+
+    def stop_workers(self) -> None:
+        """Stop all worker processes gracefully."""
+        self.stop_flag.value = True
+        for q in self.worker_queues:
+            q.put(None)
+
+    def _route_chunk(self, chunk: Dict) -> None:
+        """Route chunk to workers by MMSI hash."""
+        worker_chunks = route_chunk_to_workers(chunk, self.num_workers)
+        for worker_id, sub_chunk in worker_chunks.items():
+            self.worker_queues[worker_id].put(sub_chunk)
+
+    def wait_for_workers(self) -> None:
+        """Wait for all workers to finish."""
+        for worker in self.workers:
+            worker.join(timeout=180)
+            if worker.is_alive():
+                worker.terminate()
+        self.workers = []
+
+    def process_file(self, filepath: str) -> Dict[str, Any]:
+        """
+        Process a CSV file through the TWO-PASS pipeline.
+        """
+        start_time = time.time()
+        file_size_gb = os.path.getsize(filepath) / (1024**3)
+        
+        print(f"\n{'='*70}")
+        print(f"Processing: {os.path.basename(filepath)}")
+        print(f"File size: {file_size_gb:.2f} GB")
+        print(f"Workers: {self.num_workers}")
+        print(f"{'='*70}\n")
+        
+        # ====================================================================
+        # PASS 1: Parallel Detection of Anomalies A, C, D
+        # ====================================================================
+        print(f"{'='*70}")
+        print("PASS 1: Parallel Detection (Anomalies A, C, D)")
+        print(f"{'='*70}\n")
+        
+        pass1_start = time.time()
+        self.start_workers()
+        
+        chunks_sent = 0
+        try:
+            chunk_generator = create_mmsi_partitioned_chunks(filepath, self.chunk_size)
+            
+            for chunk in chunk_generator:
+                self._route_chunk(chunk)
+                chunks_sent += 1
+                
+                if chunks_sent % 100 == 0:
+                    mem_mb = get_memory_usage_mb()
+                    print(f"[Main] Dispatched {chunks_sent} chunks, Memory: {mem_mb:.1f} MB")
+                    
+                    if mem_mb > 800:
+                        print("[Main] WARNING: Approaching memory limit, forcing GC")
+                        gc.collect()
+                        
+        except KeyboardInterrupt:
+            print("\n[Main] Interrupted by user")
+        
+        print(f"\n[Main] Finished streaming, sent {chunks_sent} chunks")
+        
+        self.stop_workers()
+        pass1_results = self._aggregate_results()
+        self.wait_for_workers()
+        
+        pass1_time = time.time() - pass1_start
+        print(f"\n[Main] PASS 1 completed in {pass1_time:.2f} seconds")
+        
+        # ====================================================================
+        # PASS 2: Detect Anomaly B (Loitering)
+        # ====================================================================
+        print(f"\n{'='*70}")
+        print("PASS 2: Loitering Detection (Anomaly B)")
+        print(f"{'='*70}\n")
+        
+        pass2_start = time.time()
+        all_mmsi_records = pass1_results.get('mmsi_records', {})
+        loitering_anomalies = []
+        
+        if all_mmsi_records:
+            print(f"[Main] Detecting loitering with {len(all_mmsi_records)} vessels...")
+            loitering_anomalies = detect_loitering_anomalies(all_mmsi_records)
+            print(f"[Main] Found {len(loitering_anomalies)} loitering anomalies")
+        else:
+            print("[Main] WARNING: No mmsi_records available")
+        
+        pass2_time = time.time() - pass2_start
+        print(f"\n[Main] PASS 2 completed in {pass2_time:.2f} seconds")
+        
+        # ====================================================================
+        # PASS 3: Aggregate and Score
+        # ====================================================================
+        print(f"\n{'='*70}")
+        print("PASS 3: Scoring & Ranking (DFSI)")
+        print(f"{'='*70}\n")
+        
+        all_anomalies = pass1_results.get('anomalies', []) + loitering_anomalies
+        vessels_dict = aggregate_anomalies_by_vessel(all_anomalies)
+        top_vessels = rank_vessels_by_dfsi(vessels_dict, top_n=TOP_N_VESSELS)
+        
+        end_time = time.time()
+        elapsed = end_time - start_time
+        
+        # Prepare final results
+        final_results = {
+            'file': filepath,
+            'file_size_gb': file_size_gb,
+            'elapsed_seconds': elapsed,
+            'pass1_seconds': pass1_time,
+            'pass2_seconds': pass2_time,
+            'chunks_processed': chunks_sent,
+            'throughput_mb_per_sec': (file_size_gb * 1024) / elapsed if elapsed > 0 else 0,
+            'total_records': pass1_results['total_records'],
+            'unique_vessels': pass1_results['unique_vessels'],
+            'mmsi_counts': pass1_results['mmsi_counts'],
+            'anomalies': all_anomalies,
+            'vessels_by_dfsi': top_vessels,
+            'total_flagged_vessels': len(vessels_dict),
+            'max_memory_mb': pass1_results['max_memory_mb'],
+        }
+        
+        all_dfsi_scores = [v['dfsi'] for v in top_vessels]
+        final_results['dfsi_stats'] = {
+            'mean': round(sum(all_dfsi_scores) / len(all_dfsi_scores), 2) if all_dfsi_scores else 0,
+            'max': max(all_dfsi_scores) if all_dfsi_scores else 0,
+            'min': min(all_dfsi_scores) if all_dfsi_scores else 0,
+        }
+        
+        self._save_results(final_results)
+        self._print_summary(final_results)
+        
+        return final_results
+
+    def _aggregate_results(self) -> Dict[str, Any]:
+        """Collect results from all workers."""
+        worker_results = []
+        total_records = 0
+        combined_mmsi_counts: Dict[str, int] = defaultdict(int)
+        all_anomalies: List[Dict[str, Any]] = []
+        all_mmsi_records: Dict[str, List[Tuple]] = defaultdict(list)
+
+        results_received = 0
+        while results_received < self.num_workers:
+            try:
+                result = self.result_queue.get(timeout=60.0)
+                worker_results.append(result)
+                total_records += result['total_records']
+
+                for mmsi, count in result['mmsi_counts'].items():
+                    combined_mmsi_counts[mmsi] += count
+
+                all_anomalies.extend(result.get('anomalies', []))
+                
+                for mmsi, records in result.get('mmsi_records', {}).items():
+                    all_mmsi_records[mmsi].extend(records)
+
+                results_received += 1
+                print(
+                    f"[Main] Worker {result['worker_id']} — "
+                    f"{result['total_records']:,} records, "
+                    f"{len(result.get('anomalies', []))} anomalies "
+                    f"(A: {len(result.get('going_dark', []))}, "
+                    f"D: {len(result.get('teleportation', []))}, "
+                    f"C: {len(result.get('draft_change', []))})"
+                )
+
+            except Exception as e:
+                print(f"[Main] Timeout waiting for worker results: {e}")
+                break
+
+        return {
+            'worker_results': worker_results,
+            'total_records': total_records,
+            'unique_vessels': len(combined_mmsi_counts),
+            'mmsi_counts': dict(combined_mmsi_counts),
+            'anomalies': all_anomalies,
+            'mmsi_records': dict(all_mmsi_records),
+            'max_memory_mb': max(r['final_memory_mb'] for r in worker_results) if worker_results else 0,
+        }
+
+    def _save_results(self, results: Dict[str, Any]) -> None:
+        """Save results to JSON files."""
+        with open(os.path.join(ANALYSIS_DIR, 'vessel_scores.json'), 'w') as f:
+            json.dump([v for v in results.get('vessels_by_dfsi', [])], f, indent=2)
+        
+        with open(os.path.join(ANALYSIS_DIR, 'top5_vessels.json'), 'w') as f:
+            json.dump(results.get('vessels_by_dfsi', [])[:5], f, indent=2)
+        
+        metadata = {
+            'file': results['file'],
+            'file_size_gb': results['file_size_gb'],
+            'total_records': results['total_records'],
+            'unique_vessels': results['unique_vessels'],
+            'total_anomalies': len(results['anomalies']),
+            'elapsed_seconds': results['elapsed_seconds'],
+            'pass1_seconds': results['pass1_seconds'],
+            'pass2_seconds': results['pass2_seconds'],
+            'throughput_mb_per_sec': results['throughput_mb_per_sec'],
+            'max_memory_mb': results['max_memory_mb'],
+        }
+        
+        with open(os.path.join(ANALYSIS_DIR, 'run_metadata.json'), 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        print(f"\n[Main] Results saved to {ANALYSIS_DIR}/")
+
+    def _print_summary(self, results: Dict[str, Any]) -> None:
+        """Print summary of processing results."""
+        print(f"\n{'='*70}")
+        print("FINAL PROCESSING SUMMARY")
+        print(f"{'='*70}")
+        print(f"File: {os.path.basename(results['file'])}")
+        print(f"File size: {results['file_size_gb']:.2f} GB")
+        print(f"Total records: {results['total_records']:,}")
+        print(f"Unique vessels: {results['unique_vessels']:,}")
+        print(f"Chunks processed: {results['chunks_processed']:,}")
+        print()
+        print(f"Pass 1 (A, C, D detection): {results['pass1_seconds']:.2f} sec")
+        print(f"Pass 2 (B detection):        {results['pass2_seconds']:.2f} sec")
+        print(f"Total elapsed time:          {results['elapsed_seconds']:.2f} sec")
+        print()
+        print(f"Throughput: {results['throughput_mb_per_sec']:.2f} MB/sec")
+        print(f"Peak memory: {results['max_memory_mb']:.1f} MB")
+        print(f"{'='*70}")
+
+        if results['mmsi_counts']:
+            sorted_vessels = sorted(
+                results['mmsi_counts'].items(),
+                key=lambda x: x[1],
+                reverse=True,
+            )[:10]
+            print("\nTop 10 Most Active Vessels:")
+            print("-" * 40)
+            for i, (mmsi, count) in enumerate(sorted_vessels, 1):
+                print(f"  {i:2}. MMSI {mmsi}: {count:,} records")
+
+        anomalies = results.get('anomalies', [])
+        going_dark = [a for a in anomalies if a.get('anomaly_type') == 'going_dark']
+        teleportation = [a for a in anomalies if a.get('anomaly_type') == 'teleportation']
+        draft_change = [a for a in anomalies if a.get('anomaly_type') == 'draft_change']
+        loitering = [a for a in anomalies if a.get('anomaly_type') == 'loitering']
+        
+        print(f"\n{'='*70}")
+        print("ANOMALIES DETECTED")
+        print(f"{'='*70}")
+        print(f"Anomaly A (Going Dark):      {len(going_dark):>6}")
+        print(f"Anomaly D (Teleportation):   {len(teleportation):>6}")
+        print(f"Anomaly C (Draft Change):    {len(draft_change):>6}")
+        print(f"Anomaly B (Loitering):       {len(loitering):>6}")
+        print(f"{'─'*30}")
+        print(f"Total Anomalies:             {len(anomalies):>6}")
+
+        if going_dark:
+            top_anomalies = sorted(going_dark, key=lambda a: a['gap_hours'], reverse=True)[:TOP_N_GOING_DARK]
+            print(f"\nTop {TOP_N_GOING_DARK} Going-Dark Events:")
+            print("-" * 60)
+            print(f"  {'MMSI':<12} {'Gap (h)':>8}  {'Distance (km)':>14}  Gap window")
+            print("-" * 60)
+            for a in top_anomalies:
+                print(
+                    f"  {a['mmsi']:<12} {a['gap_hours']:>8.1f}  "
+                    f"{a['distance_km']:>14.1f}  "
+                    f"{a['gap_start']} → {a['gap_end']}"
+                )
+
+        if 'vessels_by_dfsi' in results:
+            top_vessels = results['vessels_by_dfsi'][:10]
+            print(f"\n{'='*70}")
+            print("TOP 10 SHADOW FLEET SUSPECTS (by DFSI)")
+            print(f"{'='*70}")
+            print(f"{'Rank':<6} {'MMSI':<12} {'DFSI':>8} {'A':>4} {'D':>6} {'C':>4} {'B':>4}")
+            print("-" * 70)
+            for i, vessel in enumerate(top_vessels, 1):
+                counts = vessel['anomaly_counts']
+                print(
+                    f"{i:<6} {vessel['mmsi']:<12} {vessel['dfsi']:>8.2f} "
+                    f"{counts.get('going_dark', 0):>4} "
+                    f"{counts.get('teleportation', 0):>6} "
+                    f"{counts.get('draft_change', 0):>4} "
+                    f"{counts.get('loitering', 0):>4}"
+                )
+            
+            print(f"\nDFSI Statistics (Top {TOP_N_VESSELS}):")
+            print(f"  Mean: {results['dfsi_stats']['mean']:.2f} | "
+                  f"Max: {results['dfsi_stats']['max']:.2f} | "
+                  f"Min: {results['dfsi_stats']['min']:.2f}")
+            print(f"  Total flagged vessels: {results.get('total_flagged_vessels', 0)}")
+
 
 def main():
     """Main entry point for Task 1."""
     
-    # Configuration - pakeiskite i savo folderi
     DATA_DIR = "./data"
     
-    # Find CSV files
     csv_files = sorted([f for f in os.listdir(DATA_DIR) if f.endswith('.csv')])
     
     if not csv_files:
@@ -149,41 +457,23 @@ def main():
         print(f"  - {f} ({size_gb:.2f} GB)")
     
     print("\n" + "="*70)
-    print("TASK 1: LOW-MEMORY PARALLEL PARTITIONING")
+    print("TWO-PASS SHADOW FLEET DETECTION PIPELINE")
+    print("Pass 1: Parallel detection (A, C, D)")
+    print("Pass 2: Loitering detection (B)")
     print("="*70)
     
-    # Process each file
     for csv_file in csv_files:
-        if not csv_file.startswith('aisdk-'):  # Only process AIS data files
+        if not csv_file.startswith('aisdk-'):
             continue
             
         filepath = os.path.join(DATA_DIR, csv_file)
         
-        # First, collect quick statistics
-        print(f"\n{'='*70}")
-        print(f"Phase 1: Quick Statistics for {csv_file}")
-        print(f"{'='*70}")
-        file_stats = collect_file_statistics(filepath, sample_size=100000)
-        print(f"  Sample analysis complete: {file_stats['valid_rows']:,} valid rows in sample")
+        pipeline = AISPipeline(num_workers=NUM_WORKERS, chunk_size=CHUNK_SIZE)
+        results = pipeline.process_file(filepath)
         
-        # Then run full parallel processing
-        print(f"\n{'='*70}")
-        print(f"Phase 2: Full Parallel Processing for {csv_file}")
-        print(f"{'='*70}")
-        
-        partitioner = StreamingPartitioner(
-            num_workers=NUM_WORKERS,
-            chunk_size=CHUNK_SIZE
-        )
-        
-        results = partitioner.process_file(filepath, use_mmsi_partitioning=True)
-        
-        print(f"\nResults saved for {csv_file}")
-        print(f"  Total valid records: {results['total_records']:,}")
-        print(f"  Unique vessels: {results['unique_vessels']:,}")
+        print(f"\n✅ Completed processing {csv_file}")
 
 
 if __name__ == "__main__":
-    # Ensure proper multiprocessing behavior on macOS
     mp.set_start_method('spawn', force=True)
     main()
