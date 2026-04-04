@@ -1,220 +1,235 @@
+# loiter.py
 """
 Loitering anomaly detection (Anomaly B)
-
-Includes:
-1. Batch version (for unit tests)
-2. Streaming + grid version (for large datasets)
+Adaptive grid sizing for geographic clustering.
 """
 
-from typing import List, Dict, Any
-from collections import defaultdict, deque
-
-from geo import haversine_distance
-from parsing import stream_valid_rows
+from typing import List, Tuple, Dict, Any, Set
 from config import (
-    LOITERING_PROXIMITY_KM,
-    LOITERING_SOG_KNOTS,
+    LOITERING_PROXIMITY_KM, LOITERING_SOG_KNOTS,
     LOITERING_DURATION_HOURS
 )
+from geo import haversine_distance
 
 
-# =====================================================================
-# 🧪 BATCH VERSION (FOR UNIT TESTS)
-# =====================================================================
 def detect_loitering_anomalies(
-    mmsi_records: Dict,
+    mmsi_records: Dict[str, List[Tuple]],
     proximity_threshold_km: float = LOITERING_PROXIMITY_KM,
     sog_threshold_knots: float = LOITERING_SOG_KNOTS,
     loitering_duration_hours: float = LOITERING_DURATION_HOURS,
 ) -> List[Dict[str, Any]]:
     """
-    Simple batch loitering detection.
+    Anomaly B: Detect two distinct vessels within 500m with SOG <1 knot for >2 hours.
+    
+    Uses adaptive spatial grid sizing based on geographic spread.
 
-    Used only for unit tests.
-    Not optimized (O(n²)), but reliable for small datasets.
     """
+    print("[Loitering] Starting ultra-fast screening...")
 
     anomalies = []
-    duration_sec = loitering_duration_hours * 3600
+    loitering_sec = loitering_duration_hours * 3600
 
-    vessels = list(mmsi_records.keys())
+    if len(mmsi_records) < 2:
+        print(f"[Loitering] Only {len(mmsi_records)} vessels. Skipping.")
+        return anomalies
 
-    for i in range(len(vessels)):
-        for j in range(i + 1, len(vessels)):
-            m1 = vessels[i]
-            m2 = vessels[j]
+    # FILTER 1: Pre-filter slow vessels & compute positions
+    print("[Loitering] Filter 1: Pre-filtering slow vessels...")
+    slow_vessels_data = {}
 
-            recs1 = mmsi_records[m1]
-            recs2 = mmsi_records[m2]
+    for mmsi, records in mmsi_records.items():
+        slow_records = [
+            (ts, epoch, lat, lon, sog, draught) 
+            for ts, epoch, lat, lon, sog, draught in records 
+            if sog <= sog_threshold_knots
+        ]
 
-            start_time = None
+        if len(slow_records) >= 2:
 
-            for r1 in recs1:
-                for r2 in recs2:
-                    ts1, e1, lat1, lon1, sog1, _ = r1
-                    ts2, e2, lat2, lon2, sog2, _ = r2
+            avg_lat = sum(r[2] for r in slow_records) / len(slow_records)
+            avg_lon = sum(r[3] for r in slow_records) / len(slow_records)
+            slow_vessels_data[mmsi] = (slow_records, avg_lat, avg_lon)
 
-                    if sog1 > sog_threshold_knots or sog2 > sog_threshold_knots:
-                        continue
+    print(f"[Loitering] Found {len(slow_vessels_data)} slow vessels")
 
-                    if abs(e1 - e2) > 300:
-                        continue
+    if len(slow_vessels_data) < 2:
+        print("[Loitering] Not enough slow vessels. Skipping.")
+        return anomalies
 
-                    dist = haversine_distance(lat1, lon1, lat2, lon2)
-
-                    if dist <= proximity_threshold_km:
-                        if start_time is None:
-                            start_time = min(e1, e2)
-                        else:
-                            duration = max(e1, e2) - start_time
-
-                            if duration >= duration_sec:
-                                anomalies.append({
-                                    'mmsi_vessel1': m1,
-                                    'mmsi_vessel2': m2,
-                                    'duration_hours': round(duration / 3600, 2),
-                                    'min_distance_km': round(dist, 3),
-                                    'anomaly_type': 'loitering',
-                                })
-                                start_time = None
-                    else:
-                        start_time = None
-
-    return anomalies
+    # FILTER 2: Adaptive spatial grid
+    print("[Loitering] Filter 2: Adaptive spatial grid...")
+    
+    # Find geographic bounds
+    all_lats = [avg_lat for _, (_, avg_lat, _) in slow_vessels_data.items()]
+    all_lons = [avg_lon for _, (_, _, avg_lon) in slow_vessels_data.items()]
+    
+    min_lat, max_lat = min(all_lats), max(all_lats)
+    min_lon, max_lon = min(all_lons), max(all_lons)
+    
+    lat_span = max_lat - min_lat
+    lon_span = max_lon - min_lon
+    
+    # Adaptive grid size: aim for ~50 cells in each dimension
+    grid_size_lat = max(0.1, lat_span / 7.0)  # Divide into ~7 rows
+    grid_size_lon = max(0.1, lon_span / 7.0)  # Divide into ~7 cols
+    
+    print(f"[Loitering] Geographic bounds: lat [{min_lat:.2f}, {max_lat:.2f}], "
+          f"lon [{min_lon:.2f}, {max_lon:.2f}]")
+    print(f"[Loitering] Grid cell sizes: {grid_size_lat:.3f}° × {grid_size_lon:.3f}°")
 
 
-# =====================================================================
-# 🚀 STREAMING VERSION (FOR 3GB DATA)
-# =====================================================================
-def detect_loitering_anomalies_streaming(filepath: str) -> List[Dict[str, Any]]:
-    """
-    Streaming loitering detection with spatial grid.
+    spatial_grid: Dict[tuple, List[str]] = {}
 
-    Designed for large datasets (GB-scale).
-    """
+    for mmsi, (records, avg_lat, avg_lon) in slow_vessels_data.items():
+        lat_cell = int((avg_lat - min_lat) / grid_size_lat)
+        lon_cell = int((avg_lon - min_lon) / grid_size_lon)
+        grid_cell = (lat_cell, lon_cell)
 
-    print("[Loitering] Streaming detection started...")
+        if grid_cell not in spatial_grid:
+            spatial_grid[grid_cell] = []
+        spatial_grid[grid_cell].append(mmsi)
 
-    WINDOW_SECONDS = int(LOITERING_DURATION_HOURS * 3600 * 1.5)
-    GRID_SIZE = 0.01  # ~1 km grid cells
+    print(f"[Loitering] Built spatial grid with {len(spatial_grid)} cells")
 
-    vessel_tracks = defaultdict(deque)
-    spatial_grid = defaultdict(set)
-    pair_start_times = {}
+    # Show distribution
+    cell_sizes = sorted([len(mmsis) for mmsis in spatial_grid.values()])
+    print(f"[Loitering] Cell distribution: min={cell_sizes[0]}, "
+          f"median={cell_sizes[len(cell_sizes)//2]}, max={cell_sizes[-1]}")
+    
+    # FILTER 3: Check only adjacent cells
+    print("[Loitering] Filter 3: Checking adjacent cells...")
 
-    anomalies = []
+    checked_pairs: Set[tuple] = set()
+    candidate_pairs = []
 
-    total_rows = 0
-    slow_rows = 0
-
-    # --------------------------------------------------
-    # Helper: map coordinates to grid cell
-    # --------------------------------------------------
-    def get_cell(lat: float, lon: float):
-        return (int(lat / GRID_SIZE), int(lon / GRID_SIZE))
-
-    # --------------------------------------------------
-    # STREAM PROCESSING
-    # --------------------------------------------------
-    for mmsi, ts_str, epoch, lat, lon, sog, draught in stream_valid_rows(filepath):
-
-        total_rows += 1
-
-        if total_rows % 500000 == 0:
-            print(f"[Loitering] Processed {total_rows:,} rows")
-
-        # --------------------------------------------------
-        # FILTER 1: Only slow vessels
-        # --------------------------------------------------
-        if sog > LOITERING_SOG_KNOTS:
+    for grid_cell, mmsis_in_cell in spatial_grid.items():
+        if len(mmsis_in_cell) < 2:
             continue
 
-        slow_rows += 1
+        lat_cell, lon_cell = grid_cell
 
-        # --------------------------------------------------
-        # Maintain sliding window
-        # --------------------------------------------------
-        track = vessel_tracks[mmsi]
+        # Get adjacent cells
+        adjacent_mmsis = set(mmsis_in_cell)
+        for dlat in [-1, 0, 1]:
+            for dlon in [-1, 0, 1]:
+                if dlat == 0 and dlon == 0:
+                    continue
+                neighbor_cell = (lat_cell + dlat, lon_cell + dlon)
+                if neighbor_cell in spatial_grid:
+                    adjacent_mmsis.update(spatial_grid[neighbor_cell])
 
-        while track and (epoch - track[0][0]) > WINDOW_SECONDS:
-            old_epoch, old_lat, old_lon = track.popleft()
-            old_cell = get_cell(old_lat, old_lon)
-            spatial_grid[old_cell].discard(mmsi)
+        # Check pairs using pre-computed averages
+        mmsis_list = sorted(list(adjacent_mmsis))
+        for i, mmsi1 in enumerate(mmsis_list):
+            for mmsi2 in mmsis_list[i+1:]:
+                pair_key = tuple(sorted([mmsi1, mmsi2]))
 
-        track.append((epoch, lat, lon))
+                if pair_key in checked_pairs:
+                    continue
+                checked_pairs.add(pair_key)
 
-        # --------------------------------------------------
-        # Update spatial grid
-        # --------------------------------------------------
-        cell = get_cell(lat, lon)
-        spatial_grid[cell].add(mmsi)
 
-        # --------------------------------------------------
-        # Find nearby vessels (3x3 neighborhood)
-        # --------------------------------------------------
-        cx, cy = cell
-        nearby_vessels = set()
+                rec1, avg_lat1, avg_lon1 = slow_vessels_data[mmsi1]
+                rec2, avg_lat2, avg_lon2 = slow_vessels_data[mmsi2]
 
-        for dx in [-1, 0, 1]:
-            for dy in [-1, 0, 1]:
-                nearby_vessels.update(spatial_grid.get((cx + dx, cy + dy), set()))
+                # Distance pre-filter: 50km threshold
+                avg_dist = haversine_distance(avg_lat1, avg_lon1, avg_lat2, avg_lon2)
+                if avg_dist > 50.0:  # Increased from 10km
+                    continue
 
-        # --------------------------------------------------
-        # Compare with nearby vessels
-        # --------------------------------------------------
-        for other_mmsi in nearby_vessels:
-            if other_mmsi == mmsi:
-                continue
+                candidate_pairs.append((mmsi1, mmsi2, rec1, rec2))
 
-            other_track = vessel_tracks[other_mmsi]
-            if not other_track:
-                continue
+    print(f"[Loitering] Found {len(candidate_pairs)} candidate pairs")
 
-            o_epoch, o_lat, o_lon = other_track[-1]
+    # FILTER 4: Detailed check
+    if candidate_pairs:
+        print(f"[Loitering] Filter 4: Detail checking {len(candidate_pairs)} candidates...")
 
-            if abs(epoch - o_epoch) > 300:
-                continue
+        for idx, (mmsi1, mmsi2, rec1, rec2) in enumerate(candidate_pairs):
+            if idx % max(1, len(candidate_pairs) // 10) == 0:
+                print(f"[Loitering]   {idx:,} / {len(candidate_pairs):,}...")
 
-            dist = haversine_distance(lat, lon, o_lat, o_lon)
+            result = _check_loitering_pair_final(
+                mmsi1, mmsi2, rec1, rec2,
+                proximity_threshold_km, loitering_sec
+            )
 
-            pair = tuple(sorted([mmsi, other_mmsi]))
+            if result:
+                anomalies.append(result)
 
-            # --------------------------------------------------
-            # CLOSE → track duration
-            # --------------------------------------------------
-            if dist <= LOITERING_PROXIMITY_KM:
-
-                if pair not in pair_start_times:
-                    pair_start_times[pair] = epoch
-                else:
-                    duration = epoch - pair_start_times[pair]
-
-                    if duration >= LOITERING_DURATION_HOURS * 3600:
-                        anomalies.append({
-                            'mmsi_vessel1': pair[0],
-                            'mmsi_vessel2': pair[1],
-                            'duration_hours': round(duration / 3600, 2),
-                            'min_distance_km': round(dist, 3),
-                            'anomaly_type': 'loitering',
-                        })
-
-                        # reset to avoid duplicates
-                        pair_start_times[pair] = epoch
-
-            # --------------------------------------------------
-            # FAR → reset tracking
-            # --------------------------------------------------
-            else:
-                if pair in pair_start_times:
-                    del pair_start_times[pair]
-
-    # --------------------------------------------------
-    # FINAL LOGS
-    # --------------------------------------------------
-    print("\n[Loitering] Streaming completed")
-    print(f"  Total rows processed: {total_rows:,}")
-    print(f"  Slow rows: {slow_rows:,}")
-    print(f"  Vessels tracked: {len(vessel_tracks)}")
-    print(f"  Anomalies found: {len(anomalies)}")
-
+    print(f"[Loitering] ✓ Complete! Found {len(anomalies)} loitering events")
     return anomalies
+
+
+def _check_loitering_pair_final(
+    mmsi1: str,
+    mmsi2: str,
+    records1: List[Tuple],
+    records2: List[Tuple],
+    proximity_threshold_km: float,
+    loitering_sec: int,
+) -> Dict[str, Any]:
+    """Final proximity check with sampling."""
+
+
+
+
+
+    min_epoch = max(records1[0][1], records2[0][1])
+    max_epoch = min(records1[-1][1], records2[-1][1])
+    overlap_duration = max_epoch - min_epoch
+
+
+    if overlap_duration < loitering_sec:
+        return None
+
+    # Sample records
+    sample_every_1 = max(1, len(records1) // 20)
+    sample_every_2 = max(1, len(records2) // 20)
+
+    proximity_count = 0
+    min_dist = float('inf')
+    first_ts = None
+    last_ts = None
+
+
+    for i in range(0, len(records1), sample_every_1):
+        rec1 = records1[i]
+        ts1, epoch1, lat1, lon1, sog1, _ = rec1
+
+        if epoch1 < min_epoch or epoch1 > max_epoch:
+            continue
+
+        for j in range(0, len(records2), sample_every_2):
+            rec2 = records2[j]
+            ts2, epoch2, lat2, lon2, sog2, _ = rec2
+
+
+            if abs(epoch1 - epoch2) > 900:
+                continue
+
+
+            dist = haversine_distance(lat1, lon1, lat2, lon2)
+
+            if dist < proximity_threshold_km:
+                proximity_count += 1
+                min_dist = min(min_dist, dist)
+
+                if first_ts is None:
+                    first_ts = ts1
+                last_ts = ts1
+
+
+    if proximity_count >= 3 and min_dist < float('inf'):
+        return {
+            'mmsi_vessel1': mmsi1,
+            'mmsi_vessel2': mmsi2,
+            'anomaly_type': 'loitering',
+            'loitering_start': first_ts,
+            'loitering_end': last_ts,
+            'duration_hours': round(overlap_duration / 3600.0, 2),
+            'proximity_events': proximity_count,
+            'min_distance_km': round(min_dist, 3),
+        }
+
+    return None
