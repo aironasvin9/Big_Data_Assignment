@@ -1,7 +1,7 @@
 # loiter.py
 """
 Loitering anomaly detection (Anomaly B)
-Expected: <5 seconds for 3,400 vessels.
+Adaptive grid sizing for geographic clustering.
 """
 
 from typing import List, Tuple, Dict, Any, Set
@@ -21,8 +21,7 @@ def detect_loitering_anomalies(
     """
     Anomaly B: Detect two distinct vessels within 500m with SOG <1 knot for >2 hours.
     
-    ULTRA-OPTIMIZED: Pre-computed averages, no redundant calculations.
-    Expected: <5 seconds for 3,400 vessels.
+    Uses adaptive spatial grid sizing based on geographic spread.
     """
     print("[Loitering] Starting ultra-fast screening...")
     
@@ -33,9 +32,9 @@ def detect_loitering_anomalies(
         print(f"[Loitering] Only {len(mmsi_records)} vessels. Skipping.")
         return anomalies
     
-    # FILTER 1: Pre-filter slow vessels ONCE and compute averages ONCE
-    print("[Loitering] Filter 1: Pre-filtering slow vessels & computing positions...")
-    slow_vessels_data = {}  # mmsi -> (records, avg_lat, avg_lon)
+    # FILTER 1: Pre-filter slow vessels & compute positions
+    print("[Loitering] Filter 1: Pre-filtering slow vessels...")
+    slow_vessels_data = {}
     
     for mmsi, records in mmsi_records.items():
         slow_records = [
@@ -45,7 +44,6 @@ def detect_loitering_anomalies(
         ]
         
         if len(slow_records) >= 2:
-            # COMPUTE AVERAGE ONLY ONCE per vessel
             avg_lat = sum(r[2] for r in slow_records) / len(slow_records)
             avg_lon = sum(r[3] for r in slow_records) / len(slow_records)
             slow_vessels_data[mmsi] = (slow_records, avg_lat, avg_lon)
@@ -56,14 +54,33 @@ def detect_loitering_anomalies(
         print("[Loitering] Not enough slow vessels. Skipping.")
         return anomalies
     
-    # FILTER 2: Spatial grid using pre-computed averages
-    print("[Loitering] Filter 2: Spatial binning (10km grid)...")
+    # FILTER 2: Adaptive spatial grid
+    print("[Loitering] Filter 2: Adaptive spatial grid...")
     
-    grid_size = 10.0
+    # Find geographic bounds
+    all_lats = [avg_lat for _, (_, avg_lat, _) in slow_vessels_data.items()]
+    all_lons = [avg_lon for _, (_, _, avg_lon) in slow_vessels_data.items()]
+    
+    min_lat, max_lat = min(all_lats), max(all_lats)
+    min_lon, max_lon = min(all_lons), max(all_lons)
+    
+    lat_span = max_lat - min_lat
+    lon_span = max_lon - min_lon
+    
+    # Adaptive grid size: aim for ~50 cells in each dimension
+    grid_size_lat = max(0.1, lat_span / 7.0)  # Divide into ~7 rows
+    grid_size_lon = max(0.1, lon_span / 7.0)  # Divide into ~7 cols
+    
+    print(f"[Loitering] Geographic bounds: lat [{min_lat:.2f}, {max_lat:.2f}], "
+          f"lon [{min_lon:.2f}, {max_lon:.2f}]")
+    print(f"[Loitering] Grid cell sizes: {grid_size_lat:.3f}° × {grid_size_lon:.3f}°")
+    
     spatial_grid: Dict[tuple, List[str]] = {}
     
     for mmsi, (records, avg_lat, avg_lon) in slow_vessels_data.items():
-        grid_cell = (int(avg_lat / grid_size), int(avg_lon / grid_size))
+        lat_cell = int((avg_lat - min_lat) / grid_size_lat)
+        lon_cell = int((avg_lon - min_lon) / grid_size_lon)
+        grid_cell = (lat_cell, lon_cell)
         
         if grid_cell not in spatial_grid:
             spatial_grid[grid_cell] = []
@@ -71,7 +88,12 @@ def detect_loitering_anomalies(
     
     print(f"[Loitering] Built spatial grid with {len(spatial_grid)} cells")
     
-    # FILTER 3: Check only adjacent grid cells
+    # Show distribution
+    cell_sizes = sorted([len(mmsis) for mmsis in spatial_grid.values()])
+    print(f"[Loitering] Cell distribution: min={cell_sizes[0]}, "
+          f"median={cell_sizes[len(cell_sizes)//2]}, max={cell_sizes[-1]}")
+    
+    # FILTER 3: Check only adjacent cells
     print("[Loitering] Filter 3: Checking adjacent cells...")
     
     checked_pairs: Set[tuple] = set()
@@ -93,7 +115,7 @@ def detect_loitering_anomalies(
                 if neighbor_cell in spatial_grid:
                     adjacent_mmsis.update(spatial_grid[neighbor_cell])
         
-        # Check pairs using PRE-COMPUTED averages
+        # Check pairs using pre-computed averages
         mmsis_list = sorted(list(adjacent_mmsis))
         for i, mmsi1 in enumerate(mmsis_list):
             for mmsi2 in mmsis_list[i+1:]:
@@ -103,20 +125,19 @@ def detect_loitering_anomalies(
                     continue
                 checked_pairs.add(pair_key)
                 
-                # Use pre-computed averages - NO recalculation
                 rec1, avg_lat1, avg_lon1 = slow_vessels_data[mmsi1]
                 rec2, avg_lat2, avg_lon2 = slow_vessels_data[mmsi2]
                 
-                # Pre-filter: if average positions >10km apart, skip
+                # Distance pre-filter: 50km threshold
                 avg_dist = haversine_distance(avg_lat1, avg_lon1, avg_lat2, avg_lon2)
-                if avg_dist > 10.0:
+                if avg_dist > 50.0:  # Increased from 10km
                     continue
                 
                 candidate_pairs.append((mmsi1, mmsi2, rec1, rec2))
     
     print(f"[Loitering] Found {len(candidate_pairs)} candidate pairs")
     
-    # FILTER 4: Detailed check on candidates only
+    # FILTER 4: Detailed check
     if candidate_pairs:
         print(f"[Loitering] Filter 4: Detail checking {len(candidate_pairs)} candidates...")
         
@@ -144,22 +165,17 @@ def _check_loitering_pair_final(
     proximity_threshold_km: float,
     loitering_sec: int,
 ) -> Dict[str, Any]:
-    """
-    Final check: verify sustained proximity over time.
-    Uses aggressive sampling for speed.
-    """
+    """Final proximity check with sampling."""
     
-    # Get time windows
     min_epoch = max(records1[0][1], records2[0][1])
     max_epoch = min(records1[-1][1], records2[-1][1])
     overlap_duration = max_epoch - min_epoch
     
-    # Must have sufficient overlap
     if overlap_duration < loitering_sec:
         return None
     
-    # Sample every Nth record (aggressive sampling)
-    sample_every_1 = max(1, len(records1) // 20)  # Sample 20 points
+    # Sample records
+    sample_every_1 = max(1, len(records1) // 20)
     sample_every_2 = max(1, len(records2) // 20)
     
     proximity_count = 0
@@ -167,7 +183,6 @@ def _check_loitering_pair_final(
     first_ts = None
     last_ts = None
     
-    # Check sampled points
     for i in range(0, len(records1), sample_every_1):
         rec1 = records1[i]
         ts1, epoch1, lat1, lon1, sog1, _ = rec1
@@ -179,11 +194,9 @@ def _check_loitering_pair_final(
             rec2 = records2[j]
             ts2, epoch2, lat2, lon2, sog2, _ = rec2
             
-            # Time match: within 15 minutes
             if abs(epoch1 - epoch2) > 900:
                 continue
             
-            # Distance check
             dist = haversine_distance(lat1, lon1, lat2, lon2)
             
             if dist < proximity_threshold_km:
@@ -194,7 +207,6 @@ def _check_loitering_pair_final(
                     first_ts = ts1
                 last_ts = ts1
     
-    # Need at least 3 proximity events
     if proximity_count >= 3 and min_dist < float('inf'):
         return {
             'mmsi_vessel1': mmsi1,
