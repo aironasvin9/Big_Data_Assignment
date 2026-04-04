@@ -2,7 +2,7 @@
 """
 Command-line interface for Two-Pass Shadow Fleet Detection.
 Pass 1: Parallel detection (A, C, D)
-Pass 2: Loitering detection (B)
+Pass 2: Loitering detection (B) - STREAMING VERSION
 """
 import csv
 from analysis import write_anomalies_csv, write_vessel_scores_csv, write_metadata_json
@@ -27,7 +27,7 @@ from detect import (
     detect_teleportation_anomalies,
     detect_draft_change_anomalies,
 )
-from loiter import detect_loitering_anomalies
+from loiter import detect_loitering_anomalies_streaming
 from scoring import (
     calculate_dfsi,
     aggregate_anomalies_by_vessel,
@@ -111,7 +111,6 @@ def worker_process(
         'going_dark': going_dark_anomalies,
         'teleportation': teleportation_anomalies,
         'draft_change': draft_change_anomalies,
-        'mmsi_records': dict(mmsi_data),
         'final_memory_mb': get_memory_usage_mb(),
     })
     
@@ -220,22 +219,16 @@ class AISPipeline:
         print(f"\n[Main] PASS 1 completed in {pass1_time:.2f} seconds")
         
         # ====================================================================
-        # PASS 2: Detect Anomaly B (Loitering)
+        # PASS 2: Detect Anomaly B (Loitering) - STREAMING VERSION
         # ====================================================================
         print(f"\n{'='*70}")
         print("PASS 2: Loitering Detection (Anomaly B)")
         print(f"{'='*70}\n")
         
         pass2_start = time.time()
-        all_mmsi_records = pass1_results.get('mmsi_records', {})
-        loitering_anomalies = []
         
-        if all_mmsi_records:
-            print(f"[Main] Detecting loitering with {len(all_mmsi_records)} vessels...")
-            loitering_anomalies = detect_loitering_anomalies(all_mmsi_records)
-            print(f"[Main] Found {len(loitering_anomalies)} loitering anomalies")
-        else:
-            print("[Main] WARNING: No mmsi_records available")
+        print(f"[Main] Processing loitering from CSV file (streaming mode)...")
+        loitering_anomalies = detect_loitering_anomalies_streaming(filepath)
         
         pass2_time = time.time() - pass2_start
         print(f"\n[Main] PASS 2 completed in {pass2_time:.2f} seconds")
@@ -285,12 +278,11 @@ class AISPipeline:
         return final_results
 
     def _aggregate_results(self) -> Dict[str, Any]:
-        """Collect results from all workers."""
+        """Collect results from all workers - WITHOUT storing mmsi_records."""
         worker_results = []
         total_records = 0
         combined_mmsi_counts: Dict[str, int] = defaultdict(int)
         all_anomalies: List[Dict[str, Any]] = []
-        all_mmsi_records: Dict[str, List[Tuple]] = defaultdict(list)
 
         results_received = 0
         while results_received < self.num_workers:
@@ -303,9 +295,6 @@ class AISPipeline:
                     combined_mmsi_counts[mmsi] += count
 
                 all_anomalies.extend(result.get('anomalies', []))
-                
-                for mmsi, records in result.get('mmsi_records', {}).items():
-                    all_mmsi_records[mmsi].extend(records)
 
                 results_received += 1
                 print(
@@ -327,7 +316,6 @@ class AISPipeline:
             'unique_vessels': len(combined_mmsi_counts),
             'mmsi_counts': dict(combined_mmsi_counts),
             'anomalies': all_anomalies,
-            'mmsi_records': dict(all_mmsi_records),
             'max_memory_mb': max(r['final_memory_mb'] for r in worker_results) if worker_results else 0,
         }
 
@@ -507,7 +495,7 @@ def main():
     print("\n" + "="*70)
     print("TWO-PASS SHADOW FLEET DETECTION PIPELINE")
     print("Pass 1: Parallel detection (A, C, D)")
-    print("Pass 2: Loitering detection (B)")
+    print("Pass 2: Loitering detection (B) - STREAMING MODE")
     print("="*70)
     
     for csv_file in csv_files:
