@@ -1,178 +1,147 @@
 # benchmark.py
 """
-Benchmarking and testing suite.
-Test on small data to verify correctness before running full dataset.
+Performance benchmarking script.
+Compares Pass 1 vs Pass 2 speed separately.
 """
 
 import os
 import time
 import tempfile
 import csv
+from datetime import datetime, timedelta
 from task1 import AISPipeline
-from config import NUM_WORKERS, CHUNK_SIZE
+from config import CHUNK_SIZE
 
 
-def create_test_csv(num_records: int = 10000) -> str:
-    """
-    Create a small test CSV file with synthetic AIS data.
+def create_benchmark_csv(num_records=100000, filename='bench.csv'):
+    """Create larger test CSV for benchmarking."""
+    test_file = os.path.join(tempfile.gettempdir(), filename)
     
-    Args:
-        num_records: Number of records to generate
+    print(f"Creating benchmark CSV: {filename}")
+    print(f"  Records: {num_records:,}")
     
-    Returns:
-        Path to test CSV file
-    """
-    test_file = os.path.join(tempfile.gettempdir(), 'test_ais_data.csv')
-    
-    print(f"[Test] Creating synthetic test CSV with {num_records:,} records...")
-    
-    # Generate test data
-    mmsis = ['211378120', '211564060', '211378130', '211378140', '211378150']  # Valid MMSIs
-    
-    with open(test_file, 'w', newline='') as f:
+    with open(test_file, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         
-        # Header
-        writer.writerow([
+        header = [
             'TIMESTAMP', 'TYPE_OF_MOBILE', 'MMSI', 'LATITUDE', 'LONGITUDE',
             'NAVIGATIONAL_STATUS', 'ROT', 'SOG', 'COG', 'HEADING', 'IMO',
-            'CALLSIGN', 'NAME', 'SHIP_AND_CARGO_TYPE', 'CARGO', 'DRAUGHT'
-        ] + [''] * 3)
+            'CALLSIGN', 'NAME', 'SHIP_AND_CARGO_TYPE', 'CARGO', 'DRAUGHT',
+            '', '', ''
+        ]
+        writer.writerow(header)
         
-        # Generate records
+        mmsis = [f'21137{8100+i}' for i in range(50)]  # 50 vessels
+        base_time = datetime(2025, 3, 2, 0, 0, 0)
+        
         for i in range(num_records):
             mmsi = mmsis[i % len(mmsis)]
-            timestamp = f"02/03/2025 {i % 24:02d}:{(i // 60) % 60:02d}:{(i * 7) % 60:02d}"
-            lat = 54.0 + (i % 100) * 0.001  # Small variation
-            lon = 12.0 + (i % 100) * 0.001
-            sog = (i % 20) / 5.0  # 0-4 knots
-            draught = 5.0 + (i % 50) * 0.1
+            ts = base_time + timedelta(seconds=i % 86400)
+            ts_str = ts.strftime('%d/%m/%Y %H:%M:%S')
             
-            writer.writerow([
-                timestamp, 'Class A', mmsi, lat, lon,
-                '0', '0', sog, '0', '0', '0',
-                f'CALL{i}', f'SHIP{i}', '70', '', draught,
-                '', '', ''
-            ])
+            lat = 54.0 + (i % 100) * 0.01
+            lon = 12.0 + (i % 100) * 0.01
+            sog = (i % 200) / 10.0
+            draught = 5.0 + (i % 100) / 10.0
+            
+            row = [ts_str, 'Class A', mmsi, lat, lon, '0', '0', sog, '0', '0', 
+                   '0', f'CALL{i}', f'SHIP{i}', '70', '', draught, '', '', '']
+            writer.writerow(row)
     
-    file_size_mb = os.path.getsize(test_file) / (1024 * 1024)
-    print(f"[Test] Created {test_file} ({file_size_mb:.2f} MB)")
-    
+    size_mb = os.path.getsize(test_file) / (1024**2)
+    print(f"  File size: {size_mb:.1f}MB\n")
     return test_file
 
 
-def test_small_dataset():
-    """Test on small synthetic dataset."""
+def benchmark_pass1_speed():
+    """Benchmark Pass 1 on different dataset sizes."""
     print("\n" + "="*70)
-    print("TESTING ON SMALL SYNTHETIC DATASET")
+    print("BENCHMARK: PASS 1 SPEED (Anomalies A, C, D)")
     print("="*70 + "\n")
     
-    # Create test file
-    test_file = create_test_csv(num_records=50000)  # ~5MB
+    sizes = [50000, 100000]
     
-    try:
-        # Run pipeline
+    for num_recs in sizes:
+        test_file = create_benchmark_csv(num_recs, f'bench_{num_recs}.csv')
+        
+        data_dir = './data'
+        os.makedirs(data_dir, exist_ok=True)
+        test_dest = os.path.join(data_dir, f'bench_{num_recs}.csv')
+        
+        import shutil
+        if os.path.exists(test_dest):
+            os.remove(test_dest)
+        shutil.copy(test_file, test_dest)
+        
+        print(f"Running Pass 1 benchmark on {num_recs:,} records...")
+        
         start = time.time()
-        pipeline = AISPipeline(num_workers=2, chunk_size=5000)  # Use 2 workers for testing
-        results = pipeline.process_file(test_file)
+        pipeline = AISPipeline(num_workers=2, chunk_size=CHUNK_SIZE)
+        results = pipeline.process_file(test_dest)
         elapsed = time.time() - start
         
-        # Print results
-        print("\n" + "="*70)
-        print("TEST RESULTS")
-        print("="*70)
-        print(f"✅ Test completed in {elapsed:.2f} seconds")
-        print(f"   Records processed: {results['total_records']:,}")
-        print(f"   Vessels detected: {results['unique_vessels']}")
-        print(f"   Anomalies found: {len(results['anomalies'])}")
-        print(f"   Memory peak: {results['max_memory_mb']:.1f} MB")
-        print(f"   Pass 1 time: {results['pass1_seconds']:.2f}s")
-        print(f"   Pass 2 time: {results['pass2_seconds']:.2f}s")
-        print("="*70 + "\n")
+        print(f"  ✓ Completed in {elapsed:.2f}s")
+        print(f"    Pass 1: {results['pass1_seconds']:.2f}s")
+        print(f"    Pass 2: {results['pass2_seconds']:.2f}s")
+        print(f"    Anomalies: {len(results['anomalies'])}")
+        print(f"    Memory: {results['max_memory_mb']:.1f}MB\n")
         
-        # Verify output files
-        print("Checking output files...")
-        analysis_files = os.listdir('./analysis') if os.path.exists('./analysis') else []
-        loitering_files = os.listdir('./loitering') if os.path.exists('./loitering') else []
-        
-        print(f"  Analysis files: {len(analysis_files)} files")
-        print(f"  Loitering files: {len(loitering_files)} files")
-        
-        if analysis_files:
-            print("\n  Files created:")
-            for f in analysis_files[:5]:
-                size = os.path.getsize(f'./analysis/{f}') / 1024
-                print(f"    - {f} ({size:.1f} KB)")
-        
-        print("\n✅ Test PASSED - Ready for full dataset!\n")
-        return True
-        
-    except Exception as e:
-        print(f"\n❌ Test FAILED: {e}\n")
-        import traceback
-        traceback.print_exc()
-        return False
-    
-    finally:
-        # Clean up test file
+        if os.path.exists(test_dest):
+            os.remove(test_dest)
         if os.path.exists(test_file):
             os.remove(test_file)
-            print(f"Cleaned up test file")
+    
+    print("="*70 + "\n")
 
 
-def test_anomaly_detection():
-    """Unit test anomaly detection functions."""
+def benchmark_pass2_speed():
+    """Benchmark Pass 2 loitering detection."""
     print("\n" + "="*70)
-    print("UNIT TESTING ANOMALY DETECTION")
+    print("BENCHMARK: PASS 2 SPEED (Anomaly B - Loitering)")
     print("="*70 + "\n")
     
-    from detect import detect_going_dark_anomalies, detect_teleportation_anomalies
-    from geo import ts_to_epoch
+    # Use the test file from tests.py
+    from tests import create_tiny_test_csv
     
-    # Test data
-    mmsi = "211378120"
+    test_file = create_tiny_test_csv(50000)
     
-    # Test 1: Going Dark
-    records_dark = [
-        ("01/03/2025 10:00:00", ts_to_epoch("01/03/2025 10:00:00"), 54.0, 12.0, 5.0, 8.0),
-        ("01/03/2025 10:10:00", ts_to_epoch("01/03/2025 10:10:00"), 54.1, 12.1, 5.0, 8.0),
-        ("01/03/2025 15:00:00", ts_to_epoch("01/03/2025 15:00:00"), 55.0, 13.0, 5.0, 8.0),  # 5hr gap, ~111km
-    ]
+    data_dir = './data'
+    os.makedirs(data_dir, exist_ok=True)
+    test_dest = os.path.join(data_dir, 'bench_pass2.csv')
     
-    going_dark = detect_going_dark_anomalies(mmsi, records_dark)
-    print(f"Test 1 - Going Dark: {len(going_dark)} anomalies found")
-    if going_dark:
-        print(f"  ✓ Gap: {going_dark[0]['gap_hours']}h, Distance: {going_dark[0]['distance_km']}km")
+    import shutil
+    if os.path.exists(test_dest):
+        os.remove(test_dest)
+    shutil.copy(test_file, test_dest)
     
-    # Test 2: Teleportation
-    records_teleport = [
-        ("01/03/2025 10:00:00", ts_to_epoch("01/03/2025 10:00:00"), 54.0, 12.0, 5.0, 8.0),
-        ("01/03/2025 10:10:00", ts_to_epoch("01/03/2025 10:10:00"), 60.0, 20.0, 100.0, 8.0),  # Impossible
-    ]
+    print(f"Running full pipeline on loitering-heavy dataset...")
     
-    teleport = detect_teleportation_anomalies(mmsi, records_teleport)
-    print(f"Test 2 - Teleportation: {len(teleport)} anomalies found")
-    if teleport:
-        print(f"  ✓ Speed: {teleport[0]['speed_knots']}knots, Distance: {teleport[0]['distance_km']}km")
+    start = time.time()
+    pipeline = AISPipeline(num_workers=2, chunk_size=CHUNK_SIZE)
+    results = pipeline.process_file(test_dest)
+    elapsed = time.time() - start
     
-    print("\n✅ Unit tests PASSED\n")
+    print(f"\n  ✓ Completed in {elapsed:.2f}s")
+    print(f"    Pass 1: {results['pass1_seconds']:.2f}s (A, C, D)")
+    print(f"    Pass 2: {results['pass2_seconds']:.2f}s (B) ⚡")
+    print(f"    Loitering events: {len([a for a in results['anomalies'] if a.get('anomaly_type') == 'loitering'])}")
+    print(f"    Memory: {results['max_memory_mb']:.1f}MB")
+    print(f"    Throughput: {results['throughput_mb_per_sec']:.2f}MB/s\n")
+    
+    if os.path.exists(test_dest):
+        os.remove(test_dest)
+    if os.path.exists(test_file):
+        os.remove(test_file)
+    
+    print("="*70 + "\n")
 
 
 if __name__ == "__main__":
     print("\n" + "="*70)
-    print("BENCHMARK & TESTING SUITE")
+    print("PERFORMANCE BENCHMARKING SUITE")
     print("="*70)
     
-    # Run tests
-    test_anomaly_detection()
-    success = test_small_dataset()
+    benchmark_pass1_speed()
+    benchmark_pass2_speed()
     
-    if success:
-        print("="*70)
-        print("ALL TESTS PASSED ✅")
-        print("Ready to run: python task1.py")
-        print("="*70 + "\n")
-    else:
-        print("="*70)
-        print("TESTS FAILED ❌")
-        print("="*70 + "\n")
+    print("✅ Benchmarking complete!\n")
