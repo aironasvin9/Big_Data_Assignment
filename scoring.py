@@ -19,7 +19,10 @@ def calculate_dfsi(mmsi: str, anomalies_for_vessel: List[Dict[str, Any]]) -> flo
     loitering = [a for a in anomalies_for_vessel if a.get('anomaly_type') == 'loitering']
     
     max_gap_hours = max((a['gap_hours'] for a in going_dark), default=0.0)
-    total_distance_nm = sum(a.get('distance_nm', a['distance_km'] / 1.852) for a in teleportation)
+    total_distance_nm = sum(
+      a.get('distance_nm') or (a.get('distance_km', 0) / 1.852)
+      for a in teleportation
+  )
     draft_count = len(draft_change)
     loitering_count = len(loitering)
     
