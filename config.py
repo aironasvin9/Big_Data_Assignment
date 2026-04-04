@@ -45,7 +45,7 @@ COL_DRAUGHT = 15
 # PROCESSING PARAMETERS
 # ============================================================================
 
-CHUNK_SIZE = 10000
+CHUNK_SIZE = 5000    
 MAX_MMSI_PER_CHUNK = 100
 NUM_WORKERS = max(1, mp.cpu_count() - 2)
 MEMORY_LIMIT_MB = 1000.0
