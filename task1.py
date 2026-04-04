@@ -127,7 +127,7 @@ class AISPipeline:
     def __init__(self, num_workers: int = NUM_WORKERS, chunk_size: int = CHUNK_SIZE):
         self.num_workers = num_workers
         self.chunk_size = chunk_size
-        self.worker_queues: List[Queue] = [Queue(maxsize=8) for _ in range(num_workers)]
+        self.worker_queues: List[Queue] = [Queue(maxsize=4) for _ in range(num_workers)]
         self.result_queue: Queue = Queue()
         self.stop_flag = Value('b', False)
         self.workers: List[Process] = []
@@ -200,6 +200,7 @@ class AISPipeline:
                 
                 if chunks_sent % 100 == 0:
                     mem_mb = get_memory_usage_mb()
+                    gc.collect()
                     print(f"[Main] Dispatched {chunks_sent} chunks, Memory: {mem_mb:.1f} MB")
                     
                     if mem_mb > 800:
